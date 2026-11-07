@@ -411,7 +411,10 @@ export component MainWindow inherits Window {
     min-height: 660px;
     no-frame: true;
     always-on-top: true;
-    background: transparent;
+    // Rounded corners need an alpha channel, which the Linux software renderer
+    // lacks; there the compositor draws the frame instead.
+    in property <bool> rounded-frame: true;
+    background: root.rounded-frame ? transparent : Theme.background;
     default-font-family: "Segoe UI";
     default-font-size: 13px;
     in-out property <int> page: 0;
@@ -447,6 +450,17 @@ export component MainWindow inherits Window {
     in property <bool> file-failed: false;
     in property <string> file-status: "Opening device storage…";
     in property <[FileRow]> file-entries;
+    // Platform capabilities, set by the application at startup.
+    in property <bool> shortcut-supported: true;
+    in property <bool> updates-supported: true;
+    in property <string> scrcpy-placeholder: "C:\\Tools\\scrcpy\\scrcpy.exe";
+    // In-app confirmation dialog (used instead of native message boxes).
+    in-out property <bool> confirm-open: false;
+    in property <string> confirm-title;
+    in property <string> confirm-message;
+    in property <string> confirm-action: "Replace";
+    callback confirm-accept();
+    callback confirm-reject();
 
     callback file-navigate(string);
     callback file-up();
@@ -480,7 +494,7 @@ export component MainWindow inherits Window {
     init => { Palette.color-scheme = dark; }
 
     Rectangle {
-        border-radius: 14px;
+        border-radius: root.rounded-frame ? 14px : 0px;
         border-width: 1px;
         border-color: #7786b3;
         background: Theme.background;
@@ -612,7 +626,7 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    Label { text: root.shortcut + "  ·  Quick Mirror"; horizontal-alignment: center; font-size: 11px; }
+                    if root.shortcut-supported: Label { text: root.shortcut + "  ·  Quick Mirror"; horizontal-alignment: center; font-size: 11px; }
                 }
                 if root.page == 1: ScrollView {
                     content-width: self.visible-width;
@@ -621,29 +635,35 @@ export component MainWindow inherits Window {
                         padding-right: 4px;
                         alignment: start;
                         Heading { text: "scrcpy location"; }
-                        LineEdit { text <=> root.scrcpy-path; placeholder-text: "C:\\Tools\\scrcpy\\scrcpy.exe"; accepted => { root.save-path(); } }
+                        LineEdit { text <=> root.scrcpy-path; placeholder-text: root.scrcpy-placeholder; accepted => { root.save-path(); } }
                         HorizontalLayout {
                             spacing: 6px;
                             Action { text: "Browse…"; clicked => { root.browse-scrcpy(); } }
                             Action { text: "Detect PATH"; clicked => { root.detect-scrcpy(); } }
                             Action { text: "Save path"; clicked => { root.save-path(); } }
                         }
-                        Heading { text: "Keyboard shortcut"; }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            LineEdit { text <=> root.shortcut-edit; placeholder-text: "Ctrl + Alt + S"; accepted => { root.save-shortcut(); } }
-                            Action { text: "Apply"; horizontal-stretch: 0; clicked => { root.save-shortcut(); } }
+                        if root.shortcut-supported: VerticalLayout {
+                            spacing: 9px;
+                            Heading { text: "Keyboard shortcut"; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                LineEdit { text <=> root.shortcut-edit; placeholder-text: "Ctrl + Alt + S"; accepted => { root.save-shortcut(); } }
+                                Action { text: "Apply"; horizontal-stretch: 0; clicked => { root.save-shortcut(); } }
+                            }
                         }
                         Action { text: "Manage templates  →"; clicked => { root.edit-template(root.default-template); root.page = 2; } }
                         Rectangle { height: 1px; background: Theme.border; }
-                        Heading { text: "App updates"; }
-                        CheckBox { text: "Auto-update"; checked <=> root.auto-update; toggled => { root.save-update-settings(); } }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            Action { text: root.updating ? "Working…" : "Check updates"; enabled: !root.updating; clicked => { root.check-updates(); } }
-                            Action { text: "Install & restart"; primary: root.update-available; enabled: root.update-available && !root.updating && !root.scanning && root.active-sessions == 0; clicked => { root.install-update(); } }
+                        if root.updates-supported: VerticalLayout {
+                            spacing: 9px;
+                            Heading { text: "App updates"; }
+                            CheckBox { text: "Auto-update"; checked <=> root.auto-update; toggled => { root.save-update-settings(); } }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Action { text: root.updating ? "Working…" : "Check updates"; enabled: !root.updating; clicked => { root.check-updates(); } }
+                                Action { text: "Install & restart"; primary: root.update-available; enabled: root.update-available && !root.updating && !root.scanning && root.active-sessions == 0; clicked => { root.install-update(); } }
+                            }
+                            Label { text: root.update-status; wrap: word-wrap; font-size: 11px; }
                         }
-                        Label { text: root.update-status; wrap: word-wrap; font-size: 11px; }
                         Label { text: root.scrcpy-version; overflow: elide; font-size: 11px; }
                         HorizontalLayout {
                             spacing: 6px;
@@ -709,6 +729,34 @@ export component MainWindow inherits Window {
                     text: "GitHub ↗";
                     description: root.repository-url;
                     clicked => { root.open-repository(); }
+                }
+            }
+        }
+        if root.confirm-open: Rectangle {
+            border-radius: root.rounded-frame ? 14px : 0px;
+            background: #000000a8;
+            // Swallow clicks so the panel behind the dialog stays inert.
+            TouchArea { }
+            Rectangle {
+                x: 24px;
+                width: parent.width - 48px;
+                height: confirm-layout.preferred-height;
+                y: (parent.height - self.height) / 2;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.background;
+                confirm-layout := VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+                    Heading { text: root.confirm-title; font-size: 15px; }
+                    Label { text: root.confirm-message; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: end;
+                        Action { text: "Cancel"; horizontal-stretch: 0; clicked => { root.confirm-reject(); } }
+                        Action { text: root.confirm-action; primary: true; horizontal-stretch: 0; clicked => { root.confirm-accept(); } }
+                    }
                 }
             }
         }

@@ -1,4 +1,4 @@
-#include "FileDropTarget.h"
+#include "platform/windows/FileDropTarget.h"
 #include <shellapi.h>
 
 namespace app {

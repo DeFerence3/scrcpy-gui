@@ -17,7 +17,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # The tray, hotkeys, process helpers, and updater currently require Windows.
   windows:
     name: Windows x64
     runs-on: windows-2022
@@ -164,25 +163,161 @@ jobs:
             build/ui-previews/
           if-no-files-found: ignore
 
+  # Built on the oldest supported Ubuntu runner so the glibc baseline stays low;
+  # the tarball runs on newer distributions such as Arch.
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      SLINT_VERSION: '1.18.1'
+      RUST_TOOLCHAIN: '1.99.1'
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read build settings
+        run: |
+          version=0.0.0
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if ! [[ "$GITHUB_REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+              echo 'Use vMAJOR.MINOR.PATCH (or vMAJOR.MINOR.PATCH.REVISION), as required by the updater.' >&2
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}"
+          fi
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$(nproc)" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build pkg-config \
+            libsystemd-dev libwayland-dev libxkbcommon-dev libfontconfig1-dev
+
+      - name: Cache Slint SDK
+        id: slint-cache
+        uses: actions/cache@v6
+        with:
+          path: build/slint-sdk
+          key: slint-sdk-v1-ubuntu-22.04-${{ runner.arch }}-${{ env.SLINT_VERSION }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('.github/workflows/distribution.yml') }}
+
+      - name: Check out pinned Slint source
+        if: steps.slint-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: slint-ui/slint
+          ref: v${{ env.SLINT_VERSION }}
+          path: build/deps/slint
+          persist-credentials: false
+
+      - name: Set up Rust
+        if: steps.slint-cache.outputs.cache-hit != 'true'
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+
+      # Same lean feature set as a local Linux build: winit with the software
+      # renderer only, so the app never loads GL drivers or Qt.
+      - name: Configure Slint SDK
+        if: steps.slint-cache.outputs.cache-hit != 'true'
+        run: >-
+          cmake -S build/deps/slint/api/cpp -B build/slint-build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          "-DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/build/slint-sdk"
+          "-DRust_TOOLCHAIN=$RUST_TOOLCHAIN"
+          -DBUILD_SHARED_LIBS=ON
+          -DSLINT_BUILD_TESTING=OFF
+          -DSLINT_FEATURE_BACKEND_QT=OFF
+          -DSLINT_FEATURE_RENDERER_SKIA=OFF
+          -DSLINT_FEATURE_RENDERER_FEMTOVG=OFF
+          -DSLINT_FEATURE_RENDERER_SOFTWARE=ON
+
+      - name: Build Slint SDK
+        if: steps.slint-cache.outputs.cache-hit != 'true'
+        run: cmake --build build/slint-build
+
+      - name: Install Slint SDK
+        if: steps.slint-cache.outputs.cache-hit != 'true'
+        run: cmake --install build/slint-build
+
+      - name: Configure Release
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          "-DSCRCPY_VERSION=$RELEASE_VERSION"
+          "-DSlint_DIR=$GITHUB_WORKSPACE/build/slint-sdk/lib/cmake/Slint"
+          -DCMAKE_REQUIRE_FIND_PACKAGE_Slint=ON
+          -DBUILD_TESTING=ON
+          -DSLINT_FEATURE_RENDERER_SOFTWARE=ON
+
+      - name: Build Release
+        run: cmake --build build
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      # The updater installs this flat tarball (bin/, lib/, share/) in place.
+      - name: Package tarball
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cpack --config build/CPackConfig.cmake -G TGZ -B build/packages
+          cd build/packages && sha256sum scrcpy-gui-linux-x64.tar.gz > SHA256SUMS.txt
+
+      - name: Upload distribution
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: scrcpy-gui-${{ github.ref_name }}-linux-x64
+          path: |
+            build/packages/scrcpy-gui-linux-x64.tar.gz
+            build/packages/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload test logs and previews
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ github.ref_name }}-linux-x64
+          path: |
+            build/Testing/Temporary/
+            build/ui-previews/
+          if-no-files-found: ignore
+
   release:
     name: Publish GitHub release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: windows
+    needs: [windows, linux]
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download tested distribution
+      - name: Download tested Windows distribution
         uses: actions/download-artifact@v8
         with:
           name: scrcpy-gui-${{ github.ref_name }}-windows-x64
-          path: packages
+          path: windows
 
-      - name: Verify distribution checksums
-        working-directory: packages
-        run: sha256sum --check SHA256SUMS.txt
+      - name: Download tested Linux distribution
+        uses: actions/download-artifact@v8
+        with:
+          name: scrcpy-gui-${{ github.ref_name }}-linux-x64
+          path: linux
+
+      - name: Verify and combine distribution checksums
+        run: |
+          (cd windows && sha256sum --check SHA256SUMS.txt)
+          (cd linux && sha256sum --check SHA256SUMS.txt)
+          mkdir packages
+          mv windows/scrcpy-gui-windows-x64.zip windows/scrcpy-gui-windows-x64.exe linux/scrcpy-gui-linux-x64.tar.gz packages/
+          cat windows/SHA256SUMS.txt linux/SHA256SUMS.txt > packages/SHA256SUMS.txt
+          (cd packages && sha256sum --check SHA256SUMS.txt)
 
       # gh uploads all assets to a draft before publishing the stable release.
-      # The updater uses releases/latest and the portable ZIP's GitHub digest.
+      # The updaters use releases/latest and the ZIP's or tarball's GitHub digest.
       - name: Publish release with distribution assets
         env:
           GH_TOKEN: ${{ secrets.PAT }}
@@ -191,6 +326,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME"
           packages/scrcpy-gui-windows-x64.zip
           packages/scrcpy-gui-windows-x64.exe
+          packages/scrcpy-gui-linux-x64.tar.gz
           packages/SHA256SUMS.txt
           --verify-tag
           --title "scrcpy-gui $GITHUB_REF_NAME"

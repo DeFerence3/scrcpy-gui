@@ -1,10 +1,12 @@
-#include "FileExplorer.h"
-#include "FileDropTarget.h"
+#include "device/FileExplorer.h"
+#include "platform/Desktop.h"
 #include <algorithm>
 #include <iomanip>
-#include <shellapi.h>
-#include <shobjidl.h>
 #include <sstream>
+#ifdef _WIN32
+#include "platform/windows/FileDropTarget.h"
+#include <ole2.h>
+#endif
 #include <set>
 #include <thread>
 
@@ -18,18 +20,6 @@ std::string file_size(uint64_t bytes) {
   std::ostringstream value;
   value << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << size << ' ' << units[unit];
   return value.str();
-}
-std::filesystem::path dialog_path(IFileDialog *dialog) {
-  std::filesystem::path result;
-  IShellItem *item = nullptr;
-  if (SUCCEEDED(dialog->GetResult(&item))) {
-    PWSTR value = nullptr;
-    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &value))) {
-      result = value; CoTaskMemFree(value);
-    }
-    item->Release();
-  }
-  return result;
 }
 }
 
@@ -50,6 +40,22 @@ std::shared_ptr<FileExplorer> FileExplorer::create(slint::ComponentHandle<MainWi
   });
   self->ui_->on_file_download([weak](int index) { if (auto s = weak.lock()) s->download(index); });
   self->ui_->on_file_upload([weak] { if (auto s = weak.lock()) s->pick_upload(); });
+  self->ui_->on_confirm_accept([weak] {
+    if (auto s = weak.lock()) {
+      s->ui_->set_confirm_open(false);
+      s->ui_->set_file_busy(false);
+      auto paths = std::move(s->pending_upload_);
+      s->pending_upload_.clear();
+      if (!s->closed_) s->upload(std::move(paths), true);
+    }
+  });
+  self->ui_->on_confirm_reject([weak] {
+    if (auto s = weak.lock()) {
+      s->ui_->set_confirm_open(false);
+      s->ui_->set_file_busy(false);
+      s->pending_upload_.clear();
+    }
+  });
   self->ui_->on_file_cancel([weak] {
     if (auto s = weak.lock(); s && s->cancel_) { s->cancel_->requested = true; s->set_status("Cancelling…"); }
   });
@@ -62,23 +68,43 @@ void FileExplorer::shutdown() {
   detach();
 }
 void FileExplorer::detach() {
-  if (registered_ && IsWindow(hwnd_)) RevokeDragDrop(hwnd_);
+#ifdef _WIN32
+  auto hwnd = static_cast<HWND>(window_);
+  if (registered_ && IsWindow(hwnd)) RevokeDragDrop(hwnd);
+#else
+  drop_target_.reset();
+#endif
   registered_ = false;
-  hwnd_ = nullptr;
+  window_ = nullptr;
   ui_->set_file_dragging(false);
 }
 void FileExplorer::set_status(const std::string &message, bool failed) {
   ui_->set_file_failed(failed);
   ui_->set_file_status(slint::SharedString(message));
 }
-void FileExplorer::attach(HWND hwnd) {
-  if (closed_ || !hwnd || (hwnd == hwnd_ && registered_)) return;
-  if (registered_ && IsWindow(hwnd_)) RevokeDragDrop(hwnd_);
-  hwnd_ = hwnd;
-  RevokeDragDrop(hwnd_);
+bool FileExplorer::accepts_drop() const {
+  return !closed_ && !installing_ && !busy() && ui_->get_page() == 3 && ui_->get_file_ready();
+}
+// Runs on the UI thread, outside the native drop callback, so dialogs and
+// transfers may start here.
+void FileExplorer::dropped(std::vector<std::filesystem::path> paths) {
+  ui_->set_file_dragging(false);
+  if (!accepts_drop()) {
+    set_status(busy() ? "Wait for the current operation to finish." : "Open a device folder before dropping files.", true);
+    return;
+  }
+  upload(std::move(paths));
+}
+void FileExplorer::attach(void *window) {
+#ifdef _WIN32
+  auto hwnd = static_cast<HWND>(window);
+  if (closed_ || !hwnd || (window == window_ && registered_)) return;
+  if (registered_ && IsWindow(static_cast<HWND>(window_))) RevokeDragDrop(static_cast<HWND>(window_));
+  window_ = window;
+  RevokeDragDrop(hwnd);
   auto weak = weak_from_this();
   auto target = app::create_file_drop_target(
-    [weak] { auto s = weak.lock(); return s && !s->closed_ && !s->installing_ && !s->busy() && s->ui_->get_page() == 3 && s->ui_->get_file_ready(); },
+    [weak] { auto s = weak.lock(); return s && s->accepts_drop(); },
     [weak](bool hovering) { if (auto s = weak.lock()) s->ui_->set_file_dragging(hovering); },
     [weak](std::vector<std::filesystem::path> paths) {
       // Leave the native drop callback before starting dialogs or transfers.
@@ -89,11 +115,23 @@ void FileExplorer::attach(HWND hwnd) {
         });
       }
     });
-  registered_ = SUCCEEDED(RegisterDragDrop(hwnd_, target));
+  registered_ = SUCCEEDED(RegisterDragDrop(hwnd, target));
   target->Release();
+#else
+  (void)window;
+  if (closed_ || registered_) return;
+  auto weak = weak_from_this();
+  // Both callbacks already run on the UI thread.
+  drop_target_ = desktop::create_file_drop_target(
+    ui_->window(),
+    [weak](bool hovering) { if (auto s = weak.lock(); s && !s->closed_) s->ui_->set_file_dragging(hovering && s->accepts_drop()); },
+    [weak](std::vector<std::filesystem::path> paths) { if (auto s = weak.lock(); s && !s->closed_) s->dropped(std::move(paths)); });
+  registered_ = drop_target_ != nullptr;
+  window_ = this; // Marks drops as attempted, for the status line.
+#endif
 }
-void FileExplorer::open(HWND hwnd, const std::wstring &adb, const std::string &serial, const std::string &name) {
-  attach(hwnd);
+void FileExplorer::open(void *window, const std::string &adb, const std::string &serial, const std::string &name) {
+  attach(window);
   ui_->set_page(3);
   if (busy()) {
     if (serial != serial_) set_status("Finish or cancel the current operation before switching devices.");
@@ -132,7 +170,11 @@ void FileExplorer::navigate(const std::string &path, const std::string &message,
       s.ui_->set_file_entries(std::make_shared<slint::VectorModel<FileRow>>(rows));
       s.ui_->set_file_ready(true);
       s.set_status(message.empty() ? std::to_string(rows.size()) + " items · " + target : message, failed);
-      if (!s.registered_ && s.hwnd_) s.set_status("Drag and drop is unavailable. Use the upload icon.", true);
+#ifndef _WIN32
+      // The Wayland surface may not have existed yet when the panel was shown.
+      if (!s.registered_ && s.ui_->window().is_visible()) s.attach(nullptr);
+#endif
+      if (!s.registered_ && s.window_) s.set_status("Drag and drop is unavailable. Use the upload icon.", true);
     });
   }).detach();
 }
@@ -143,7 +185,7 @@ void FileExplorer::finish(const std::string &error, const std::string &success, 
   if (refresh) navigate(folder_, error.empty() ? success : error, !error.empty());
   else set_status(error.empty() ? success : error, !error.empty());
 }
-void FileExplorer::upload(std::vector<std::filesystem::path> paths) {
+void FileExplorer::upload(std::vector<std::filesystem::path> paths, bool confirmed) {
   if (ui_->get_page() != 3 || busy() || !ui_->get_file_ready() || paths.empty()) return;
   if (installing_) { set_status("Wait for the GUI update to finish."); return; }
   std::vector<std::string> collisions;
@@ -151,7 +193,7 @@ void FileExplorer::upload(std::vector<std::filesystem::path> paths) {
   for (const auto &path : paths) {
     std::error_code error;
     if (!std::filesystem::is_regular_file(path, error)) { set_status("Drop files only; folders cannot be uploaded.", true); return; }
-    auto name = app::utf8(path.filename().wstring());
+    auto name = app::to_utf8(path.filename());
     if (!names.insert(name).second) { set_status("Two selected files have the same name: " + name + ". Rename one first.", true); return; }
     auto existing = std::find_if(files_.begin(), files_.end(), [&](const auto &file) { return file.name == name; });
     if (existing != files_.end()) {
@@ -159,15 +201,17 @@ void FileExplorer::upload(std::vector<std::filesystem::path> paths) {
       collisions.push_back(name);
     }
   }
-  if (!collisions.empty()) {
+  if (!collisions.empty() && !confirmed) {
     std::string prompt = "Replace these files in " + folder_ + "?\n";
     for (size_t i = 0; i < std::min<size_t>(collisions.size(), 8); ++i) prompt += "\n" + collisions[i];
     if (collisions.size() > 8) prompt += "\n…";
-    // Keep the device and destination fixed while the modal prompt pumps events.
+    // Keep the device and destination fixed while the prompt is open.
     ui_->set_file_busy(true);
-    auto answer = MessageBoxW(hwnd_, app::wide(prompt).c_str(), L"Replace device files", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-    ui_->set_file_busy(false);
-    if (answer != IDYES || closed_) return;
+    pending_upload_ = std::move(paths);
+    ui_->set_confirm_title("Replace device files");
+    ui_->set_confirm_message(slint::SharedString(prompt));
+    ui_->set_confirm_open(true);
+    return;
   }
   ui_->set_file_path(slint::SharedString(folder_)); // An unsubmitted path edit is not the upload destination.
   ui_->set_file_busy(true); set_status("Preparing upload…");
@@ -186,66 +230,53 @@ void FileExplorer::upload(std::vector<std::filesystem::path> paths) {
 void FileExplorer::pick_upload() {
   if (ui_->get_page() != 3 || busy() || !ui_->get_file_ready()) return;
   if (installing_) { set_status("Wait for the GUI update to finish."); return; }
-  // Native dialogs run on the UI's STA and pump messages. Busy prevents a second
-  // operation or device switch while the selection is pending.
+  // Busy prevents a second operation or device switch while the selection is pending.
   ui_->set_file_busy(true);
-  IFileOpenDialog *dialog = nullptr;
-  std::vector<std::filesystem::path> paths;
-  HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-  if (SUCCEEDED(result)) {
-    dialog->SetTitle(L"Upload files to the open device folder");
-    dialog->SetOptions(FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
-    result = dialog->Show(hwnd_);
-    if (SUCCEEDED(result)) {
-      IShellItemArray *items = nullptr;
-      if (SUCCEEDED(dialog->GetResults(&items))) {
-        DWORD count = 0; items->GetCount(&count);
-        for (DWORD i = 0; i < count; ++i) {
-          IShellItem *item = nullptr;
-          if (SUCCEEDED(items->GetItemAt(i, &item))) {
-            PWSTR path = nullptr;
-            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) { paths.emplace_back(path); CoTaskMemFree(path); }
-            item->Release();
-          }
-        }
-        items->Release();
-      }
-    }
-    dialog->Release();
-  }
-  ui_->set_file_busy(false);
-  if (FAILED(result) && result != HRESULT_FROM_WIN32(ERROR_CANCELLED)) set_status("Could not open the file picker.", true);
-  if (!closed_) upload(std::move(paths));
+  desktop::FileDialog dialog;
+  dialog.title = "Upload files to the open device folder";
+  dialog.multiple = true;
+  auto weak = weak_from_this();
+  desktop::choose_files(dialog, [weak](std::vector<std::filesystem::path> paths, std::string error) {
+    auto s = weak.lock();
+    if (!s || s->closed_) return;
+    s->ui_->set_file_busy(false);
+    if (!error.empty()) s->set_status(error, true);
+    else s->upload(std::move(paths));
+  });
 }
 void FileExplorer::download(int index) {
   if (ui_->get_page() != 3 || busy() || !ui_->get_file_ready() || index < 0 || index >= (int)files_.size() || files_[index].directory) return;
   if (installing_) { set_status("Wait for the GUI update to finish."); return; }
   auto remote = app::device_child(folder_, files_[index].name);
-  auto name = app::wide(files_[index].name);
-  for (auto &ch : name) if (ch < 32 || std::wstring(L"<>:\"/\\|?*").find(ch) != std::wstring::npos) ch = L'_';
-  while (!name.empty() && (name.back() == L'.' || name.back() == L' ')) name.pop_back();
-  if (name.empty()) name = L"download";
+  auto name = files_[index].name;
+  // Keep names valid on Windows too, so downloads behave the same everywhere.
+  for (auto &ch : name)
+    if (static_cast<unsigned char>(ch) < 32 || std::string("<>:\"/\\|?*").find(ch) != std::string::npos) ch = '_';
+  while (!name.empty() && (name.back() == '.' || name.back() == ' ')) name.pop_back();
+  if (name.empty()) name = "download";
   ui_->set_file_busy(true);
-  IFileSaveDialog *dialog = nullptr;
-  std::filesystem::path local;
-  HRESULT result = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-  if (SUCCEEDED(result)) {
-    dialog->SetTitle(L"Download device file"); dialog->SetFileName(name.c_str());
-    dialog->SetOptions(FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
-    result = dialog->Show(hwnd_);
-    if (SUCCEEDED(result)) local = dialog_path(dialog);
-    dialog->Release();
-  }
-  if (local.empty() || closed_) {
-    ui_->set_file_busy(false);
-    if (FAILED(result) && result != HRESULT_FROM_WIN32(ERROR_CANCELLED)) set_status("Could not open the Save As dialog.", true);
-    return;
-  }
-  set_status("Downloading " + files_[index].name + "…");
+  desktop::FileDialog dialog;
+  dialog.title = "Download device file";
+  dialog.save = true;
+  dialog.suggested_name = name;
+  auto weak = weak_from_this();
+  desktop::choose_files(dialog, [weak, remote, label = files_[index].name](std::vector<std::filesystem::path> paths, std::string error) {
+    auto s = weak.lock();
+    if (!s || s->closed_) return;
+    if (paths.empty()) {
+      s->ui_->set_file_busy(false);
+      if (!error.empty()) s->set_status(error, true);
+      return;
+    }
+    s->start_download(remote, label, paths.front());
+  });
+}
+void FileExplorer::start_download(const std::string &remote, const std::string &label, const std::filesystem::path &local) {
+  set_status("Downloading " + label + "…");
   cancel_ = std::make_shared<app::Cancel>();
   auto weak = weak_from_this();
   std::thread([weak, adb = adb_, serial = serial_, remote, local, cancel = cancel_] {
     auto error = app::download_device_file(adb, serial, remote, local, cancel);
-    post(weak, [error, local](FileExplorer &s) { s.finish(error, "Saved to " + app::utf8(local.wstring()), false); });
+    post(weak, [error, local](FileExplorer &s) { s.finish(error, "Saved to " + app::to_utf8(local), false); });
   }).detach();
 }

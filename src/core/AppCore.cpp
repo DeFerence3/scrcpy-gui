@@ -1,13 +1,9 @@
-#include "AppCore.h"
+#include "core/AppCore.h"
+#include "platform/Platform.h"
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
-#ifdef _WIN32
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
 
 namespace app {
 std::string trim(std::string text) {
@@ -116,16 +112,10 @@ bool save_settings(const std::filesystem::path &path, const Settings &settings,
       return false;
     }
     out.close();
-#ifdef _WIN32
-    if (!MoveFileExW(temp.c_str(), path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-      error = "Unable to replace settings (Windows error " +
-              std::to_string(GetLastError()) + ").";
+    if (auto failure = replace_file(temp, path); !failure.empty()) {
+      error = "Unable to replace settings: " + failure;
       return false;
     }
-#else
-    std::filesystem::rename(temp, path);
-#endif
     return true;
   } catch (const std::exception &e) {
     error = e.what();

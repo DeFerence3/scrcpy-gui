@@ -1,15 +1,20 @@
 #include "main.h"
-#include "DeviceModel.h"
-#include "FileExplorer.h"
-#include "Scrcpy.h"
+#include "platform/Desktop.h"
+#include "device/DeviceModel.h"
+#include "device/FileExplorer.h"
+#include "scrcpy/Scrcpy.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <set>
-#include <shellapi.h>
-#include <shobjidl.h>
 #include <sstream>
 #include <thread>
+#ifdef _WIN32
+#include <ole2.h>
+#else
+#include "platform/linux/Updater.h"
+#endif
 
 
 #ifndef APP_VERSION
@@ -17,20 +22,19 @@
 #endif
 
 namespace {
-constexpr UINT TrayMessage = WM_APP + 1;
-constexpr UINT ShowCommand = 1001, MirrorCommand = 1002, QuitCommand = 1003;
-const wchar_t *WindowTitle = L"Scrcpy Tray Tool";
 std::string text(const slint::SharedString &s) {
   return std::string(s.data(), s.size());
 }
-std::wstring powershell() {
+const std::string scrcpy_name = std::string("scrcpy") + app::executable_suffix;
+constexpr bool updates_supported = true;
+#ifdef _WIN32
+// Self-update is implemented by update.ps1 on Windows and Updater_posix.cpp on Linux.
+std::string powershell() {
   wchar_t system[32768]{};
   GetSystemDirectoryW(system, 32768);
-  return std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+  return app::utf8(system) + "\\WindowsPowerShell\\v1.0\\powershell.exe";
 }
-class Controller;
-Controller *controller = nullptr;
-LRESULT CALLBACK tray_proc(HWND, UINT, WPARAM, LPARAM);
+#endif
 
 class Controller : public std::enable_shared_from_this<Controller> {
 public:
@@ -38,12 +42,11 @@ public:
   app::Settings settings;
   std::unique_ptr<Scrcpy> scrcpy;
   std::shared_ptr<FileExplorer> explorer;
-  HWND tray = nullptr;
-  NOTIFYICONDATAW icon{};
+  std::unique_ptr<desktop::Integration> desktop;
   bool visible = false, picking = false, focused = false, pending_quick = false;
   bool shutting_down = false, settings_writable = true, installing = false,
        auto_install_attempted = false;
-  ULONGLONG shown_at = 0, hidden_at = 0;
+  uint64_t shown_at = 0, hidden_at = 0;
   int hotkey_id = 0;
   std::vector<app::Device> devices;
   std::shared_ptr<DeviceModel> device_model = std::make_shared<DeviceModel>();
@@ -66,8 +69,13 @@ public:
       auto end = value.find('\n', value.size() - limit);
       if (end != std::string::npos)
         value.erase(0, end + 1);
-      else
-        value = app::utf8(app::wide(value.substr(value.size() - limit)));
+      else {
+        // Never start the log in the middle of a UTF-8 character.
+        auto start = value.size() - limit;
+        while (start < value.size() && (static_cast<unsigned char>(value[start]) & 0xc0) == 0x80)
+          ++start;
+        value.erase(0, start);
+      }
     }
     ui->set_console_text(slint::SharedString(value));
   }
@@ -89,7 +97,7 @@ public:
     return true;
   }
   void show(bool toggle = false) {
-    if (toggle && GetTickCount64() - hidden_at < 400)
+    if (toggle && app::milliseconds() - hidden_at < 400)
       return;
     if (visible && toggle) {
       hide();
@@ -97,32 +105,15 @@ public:
     }
     ui->window().set_minimized(false);
     ui->show();
+    // On Wayland a window created while hidden maps only once it draws a
+    // frame; Slint does not schedule one for the first show after --startup.
+    ui->window().request_redraw();
     visible = true;
     focused = false;
-    shown_at = GetTickCount64();
-    if (HWND hwnd = FindWindowW(nullptr, WindowTitle)) {
-      // Restore before measuring: a minimized window has a tiny rectangle,
-      // which would otherwise anchor the full window below the work area.
-      ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
-      if (explorer)
-        explorer->attach(hwnd);
-      RECT area{}, rect{};
-      POINT cursor{};
-      GetCursorPos(&cursor);
-      MONITORINFO monitor{sizeof(monitor)};
-      if (GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST),
-                          &monitor))
-        area = monitor.rcWork;
-      else
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
-      GetWindowRect(hwnd, &rect);
-      SetWindowPos(
-          hwnd, HWND_TOPMOST,
-          std::max<LONG>(area.left, area.right - (rect.right - rect.left) - 12),
-          std::max<LONG>(area.top, area.bottom - (rect.bottom - rect.top) - 12),
-          0, 0, SWP_NOSIZE);
-      SetForegroundWindow(hwnd);
-    }
+    shown_at = app::milliseconds();
+    desktop::present_window();
+    if (explorer)
+      explorer->attach(desktop::native_window());
   }
   void hide() {
     if (explorer)
@@ -130,7 +121,7 @@ public:
     ui->hide();
     ui->set_page(0);
     visible = focused = false;
-    hidden_at = GetTickCount64();
+    hidden_at = app::milliseconds();
   }
   void quit() {
     shutting_down = true;
@@ -140,9 +131,11 @@ public:
     scrcpy->stop();
     if (explorer)
       explorer->shutdown();
-    Shell_NotifyIconW(NIM_DELETE, &icon);
-    if (hotkey_id)
-      UnregisterHotKey(tray, hotkey_id);
+    // The tray itself is destroyed after the event loop returns, because this
+    // may run inside a tray callback.
+    if (hotkey_id && desktop)
+      desktop->unregister_hotkey(hotkey_id);
+    hotkey_id = 0;
     slint::quit_event_loop();
   }
   void publish_devices() {
@@ -260,7 +253,7 @@ public:
     if (scrcpy->path().empty()) {
       ui->set_page(1);
       show();
-      status("Choose scrcpy.exe before mirroring.");
+      status("Choose " + scrcpy_name + " before mirroring.");
       return;
     }
     auto d =
@@ -292,7 +285,7 @@ public:
     }
     if (!explorer)
       explorer = FileExplorer::create(ui);
-    explorer->open(FindWindowW(nullptr, WindowTitle), scrcpy->adb_path(),
+    explorer->open(desktop::native_window(), scrcpy->adb_path(),
                    serial, device->name);
   }
   bool show_if_mirroring() {
@@ -317,7 +310,7 @@ public:
       pending_quick = false;
       ui->set_page(1);
       show();
-      status("Select scrcpy.exe in Settings to get started.");
+      status("Select " + scrcpy_name + " in Settings to get started.");
       return;
     }
     ui->set_scanning(true);
@@ -370,7 +363,7 @@ public:
     });
   }
   void path_changed() {
-    settings.scrcpy_path = app::utf8(scrcpy->path());
+    settings.scrcpy_path = scrcpy->path();
     ui->set_scrcpy_path(slint::SharedString(settings.scrcpy_path));
     save();
     auto weak = weak_from_this();
@@ -387,76 +380,56 @@ public:
     if (picking || installing)
       return;
     picking = true;
-    HWND owner = FindWindowW(nullptr, WindowTitle);
+    desktop::FileDialog dialog;
+    dialog.title = "Select " + scrcpy_name;
+    dialog.filters = {{"scrcpy executable", scrcpy_name},
+                      {"All executables", std::string("*") + app::executable_suffix}};
     auto weak = weak_from_this();
-    std::thread([weak, owner] {
-      std::wstring selected;
-      if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                                COINIT_DISABLE_OLE1DDE))) {
-        IFileOpenDialog *dialog = nullptr;
-        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                       CLSCTX_INPROC_SERVER,
-                                       IID_PPV_ARGS(&dialog)))) {
-          COMDLG_FILTERSPEC filters[] = {{L"scrcpy executable", L"scrcpy.exe"},
-                                         {L"Executables", L"*.exe"}};
-          dialog->SetFileTypes(2, filters);
-          dialog->SetTitle(L"Select scrcpy.exe");
-          dialog->SetOptions(FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST |
-                             FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
-          if (SUCCEEDED(dialog->Show(owner))) {
-            IShellItem *item = nullptr;
-            if (SUCCEEDED(dialog->GetResult(&item))) {
-              PWSTR path = nullptr;
-              if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-                selected = path;
-                CoTaskMemFree(path);
-              }
-              item->Release();
-            }
-          }
-          dialog->Release();
-        }
-        CoUninitialize();
-      }
-      post(weak, [selected](Controller &c) {
+    desktop::choose_files(dialog, [weak](std::vector<std::filesystem::path> paths, std::string error) {
+      post(weak, [paths = std::move(paths), error](Controller &c) {
         c.picking = false;
-        if (!selected.empty() && c.scrcpy->set_path(selected)) {
+        if (!error.empty())
+          c.status(error);
+        else if (!paths.empty() && c.scrcpy->set_path(app::to_utf8(paths.front()))) {
           c.path_changed();
           c.status("scrcpy path saved.");
         }
         c.show();
       });
-    }).detach();
+    });
   }
   bool apply_shortcut(const std::string &value, bool persist) {
-    UINT modifiers = 0, key = 0;
-    std::string canonical;
-    if (!app::parse_hotkey(value, modifiers, key, canonical)) {
+    std::string canonical, error;
+    if (!desktop->hotkeys_supported())
+      return false;
+    int new_id = desktop->register_hotkey(value, canonical, error);
+    if (new_id < 0) {
       status("Use modifiers plus A–Z, 0–9 or F1–F24 (for example Ctrl + Alt + "
              "S).");
       return false;
     }
     if (hotkey_id && canonical == settings.shortcut) {
+      if (new_id > 0)
+        desktop->unregister_hotkey(new_id);
       ui->set_shortcut_edit(slint::SharedString(canonical));
       status("Shortcut is already active.");
       return true;
     }
-    int new_id = hotkey_id == 1 ? 2 : 1;
-    if (!RegisterHotKey(tray, new_id, modifiers | MOD_NOREPEAT, key)) {
+    if (new_id == 0) {
       status("Shortcut unavailable; another app may be using it. Choose a "
              "different combination.");
-      log("[shortcut] " + app::system_error() + "\n");
+      log("[shortcut] " + error + "\n");
       return false;
     }
     auto previous = settings.shortcut;
     settings.shortcut = canonical;
     if (persist && !save()) {
       settings.shortcut = previous;
-      UnregisterHotKey(tray, new_id);
+      desktop->unregister_hotkey(new_id);
       return false;
     }
     if (hotkey_id)
-      UnregisterHotKey(tray, hotkey_id);
+      desktop->unregister_hotkey(hotkey_id);
     hotkey_id = new_id;
     ui->set_shortcut(slint::SharedString(canonical));
     ui->set_shortcut_edit(slint::SharedString(canonical));
@@ -482,7 +455,7 @@ public:
       update(false);
   }
   void update(bool install) {
-    if (ui->get_updating())
+    if (!updates_supported || ui->get_updating())
       return;
     if (install && (!sessions.empty() || picking || ui->get_scanning() ||
                     pending_quick || (explorer && explorer->busy()))) {
@@ -493,11 +466,13 @@ public:
     if (install && available_version.empty())
       return;
     auto script = app::executable_directory() / "update.ps1";
+#ifdef _WIN32
     if (!std::filesystem::exists(script)) {
       ui->set_update_status(
           "update.ps1 is missing from the application folder.");
       return;
     }
+#endif
     ui->set_updating(true);
     installing = install;
     if (explorer)
@@ -508,31 +483,36 @@ public:
     auto expected = available_version;
     auto weak = weak_from_this();
     std::thread([weak, script, expected, install] {
-      std::vector<std::wstring> args{L"-NoProfile",
-                                     L"-NonInteractive",
-                                     L"-ExecutionPolicy",
-                                     L"Bypass",
-                                     L"-File",
-                                     script.wstring(),
-                                     L"-Mode",
-                                     install ? L"Stage" : L"Check",
-                                     L"-Repository",
-                                     app::wide(app::update_repository),
-                                     L"-CurrentVersion",
-                                     app::wide(APP_VERSION),
-                                     L"-ExpectedVersion",
-                                     app::wide(expected),
-                                     L"-Architecture",
+#ifdef _WIN32
+      std::vector<std::string> args{"-NoProfile",
+                                    "-NonInteractive",
+                                    "-ExecutionPolicy",
+                                    "Bypass",
+                                    "-File",
+                                    app::to_utf8(script),
+                                    "-Mode",
+                                    install ? "Stage" : "Check",
+                                    "-Repository",
+                                    app::update_repository,
+                                    "-CurrentVersion",
+                                    APP_VERSION,
+                                    "-ExpectedVersion",
+                                    expected,
+                                    "-Architecture",
 #if defined(_M_ARM64)
-                                     L"arm64"
+                                    "arm64"
 #elif defined(_WIN64)
-                                     L"x64"
+                                    "x64"
 #else
-                                     L"x86"
+                                    "x86"
 #endif
       };
       auto result =
           app::run_process(powershell(), args, {}, install ? 240000 : 45000);
+#else
+      (void)script; // update.ps1 is Windows-only.
+      auto result = update::run(install, app::update_repository, APP_VERSION, expected);
+#endif
       post(weak, [result, install](Controller &c) {
         c.ui->set_updating(false);
         c.installing = false;
@@ -557,6 +537,13 @@ public:
           c.available_version.clear();
           c.ui->set_update_available(false);
           c.ui->set_update_status(slint::SharedString(value));
+        } else if (marker == "__MANUAL__") {
+          // Installed by a package manager or into a read-only prefix.
+          c.available_version.clear();
+          c.ui->set_update_available(false);
+          c.ui->set_update_status(slint::SharedString(
+              "GUI " + value + " is available. Update it the way you installed it, "
+              "or download it from the repository's Releases page."));
         } else if (marker == "__AVAILABLE__") {
           c.available_version = value;
           c.ui->set_update_available(true);
@@ -569,7 +556,7 @@ public:
             c.ui->set_update_status("Update available; installation waits "
                                     "until mirroring has stopped.");
         } else if (marker == "__READY__" && install)
-          c.apply_update(app::wide(value));
+          c.apply_update(app::from_utf8(value));
         else
           c.ui->set_update_status(
               "Unexpected update response. See Logs for details.");
@@ -577,6 +564,7 @@ public:
     }).detach();
   }
   void apply_update(const std::filesystem::path &stage) {
+#ifdef _WIN32
     try {
       auto helper = stage / "apply-helper.ps1";
       std::filesystem::copy_file(
@@ -585,11 +573,11 @@ public:
       std::string error;
       if (!app::launch_detached(
               powershell(),
-              {L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy",
-               L"Bypass", L"-File", helper.wstring(), L"-Mode", L"Apply",
-               L"-StageDirectory", stage.wstring(), L"-InstallDirectory",
-               app::executable_directory().wstring(), L"-ParentProcessId",
-               std::to_wstring(GetCurrentProcessId())},
+              {"-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+               "Bypass", "-File", app::to_utf8(helper), "-Mode", "Apply",
+               "-StageDirectory", app::to_utf8(stage), "-InstallDirectory",
+               app::to_utf8(app::executable_directory()), "-ParentProcessId",
+               std::to_string(app::process_id())},
               error)) {
         log(error + "\n");
         ui->set_update_status("Could not start the update helper.");
@@ -600,9 +588,27 @@ public:
       log(std::string(e.what()) + "\n");
       ui->set_update_status("Unable to stage update helper.");
     }
+#else
+    std::string reason;
+    auto prefix = update::install_prefix(reason);
+    auto error = prefix.empty() ? reason : update::apply(stage, prefix);
+    if (!error.empty()) {
+      log("[update] " + error + "\n");
+      ui->set_update_status("Update failed. See Logs for details.");
+      return;
+    }
+    std::ofstream(update::state_directory() / "result.txt", std::ios::trunc)
+        << "GUI update installed successfully.\n";
+    // Hand the instance lock to the new copy before starting it.
+    desktop::release_single_instance();
+    std::error_code ignored;
+    auto exe = app::to_utf8(std::filesystem::read_symlink("/proc/self/exe", ignored));
+    if (!app::launch_detached(exe, {"--updated"}, error))
+      log("[update] Installed, but could not restart: " + error + "\n");
+    quit();
+#endif
   }
   void initialize(bool updated, bool startup) {
-    controller = this;
     settings_path = app::config_directory() / "settings.dat";
     std::string error;
     settings_writable = app::load_settings(settings_path, settings, error);
@@ -632,24 +638,28 @@ public:
               c.update(true);
           });
         });
-    HINSTANCE instance = GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = tray_proc;
-    wc.hInstance = instance;
-    wc.lpszClassName = L"ScrcpyTrayMsgWnd";
-    RegisterClassW(&wc);
-    tray = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, nullptr,
-                           nullptr, instance, nullptr);
-    icon.cbSize = sizeof(icon);
-    icon.hWnd = tray;
-    icon.uID = 1;
-    icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    icon.uCallbackMessage = TrayMessage;
-    icon.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
-    wcscpy_s(icon.szTip, L"scrcpy-gui · Quick Mirror");
-    Shell_NotifyIconW(NIM_ADD, &icon);
+    desktop::Events events;
+    events.activate = [this] {
+      show(true);
+      if (visible)
+        refresh(false, true);
+    };
+    events.toggle = [this] { show(true); };
+    events.quick_mirror = [this] { refresh(true); };
+    events.second_instance = [this] {
+      show();
+      refresh(true);
+    };
+    events.quit = [this] { quit(); };
+    desktop = desktop::Integration::create(std::move(events));
+    ui->set_shortcut_supported(desktop->hotkeys_supported());
+    ui->set_updates_supported(updates_supported);
+#ifndef _WIN32
+    ui->set_scrcpy_placeholder("/usr/bin/scrcpy");
+    ui->set_rounded_frame(false);
+#endif
     ui->set_shortcut_edit(slint::SharedString(settings.shortcut));
-    if (!apply_shortcut(settings.shortcut, false))
+    if (desktop->hotkeys_supported() && !apply_shortcut(settings.shortcut, false))
       ui->set_shortcut("Shortcut unavailable");
     ui->on_refresh_devices([this] { refresh(); });
     ui->on_mirror_device(
@@ -669,11 +679,11 @@ public:
         status("scrcpy was not found on PATH. Use Browse to select it.");
     });
     ui->on_save_path([this] {
-      if (scrcpy->set_path(app::wide(app::trim(text(ui->get_scrcpy_path()))))) {
+      if (scrcpy->set_path(app::trim(text(ui->get_scrcpy_path())))) {
         path_changed();
         status("scrcpy path saved.");
       } else
-        status("Invalid executable path. Select an existing scrcpy.exe.");
+        status("Invalid executable path. Select an existing " + scrcpy_name + ".");
     });
     ui->on_restart_adb([this, weak] {
       if (explorer && explorer->busy()) {
@@ -696,10 +706,8 @@ public:
     ui->on_check_updates([this] { update(false); });
     ui->on_install_update([this] { update(true); });
     ui->on_open_repository([this] {
-      const auto url = app::wide(text(ui->get_repository_url()));
-      const auto result = ShellExecuteW(nullptr, L"open", url.c_str(), nullptr,
-                                        nullptr, SW_SHOWNORMAL);
-      if (reinterpret_cast<INT_PTR>(result) <= 32)
+      std::string error;
+      if (!app::open_url(text(ui->get_repository_url()), error))
         status("Could not open the GitHub repository in your browser.");
     });
     ui->on_make_default([this] {
@@ -730,7 +738,7 @@ public:
         explorer->detach();
       ui->set_page(0);
       visible = focused = false;
-      hidden_at = GetTickCount64();
+      hidden_at = app::milliseconds();
       return slint::CloseRequestResponse::HideWindow;
     });
     focus_timer.start(
@@ -739,15 +747,9 @@ public:
           if (!visible || picking || ui->get_pinned() || ui->get_page() == 3 ||
               (explorer && explorer->busy()))
             return;
-          HWND hwnd = FindWindowW(nullptr, WindowTitle),
-               fg = GetForegroundWindow();
-          // Combo-box popups and the file picker owned by this process must not
-          // dismiss the panel.
-          DWORD pid = 0;
-          GetWindowThreadProcessId(fg, &pid);
-          if (hwnd && (fg == hwnd || pid == GetCurrentProcessId()))
+          if (desktop::app_has_focus())
             focused = true;
-          else if (focused || GetTickCount64() - shown_at > 2000)
+          else if (focused || app::milliseconds() - shown_at > 2000)
             hide();
         });
     device_timer.start(slint::TimerMode::Repeated, std::chrono::seconds(5),
@@ -759,8 +761,9 @@ public:
                          if (visible && ui->get_page() == 0 && !installing)
                            refresh(false, true);
                        });
-    update_timer.start(slint::TimerMode::Repeated, std::chrono::hours(6),
-                       [this] { update(false); });
+    if (updates_supported)
+      update_timer.start(slint::TimerMode::Repeated, std::chrono::hours(6),
+                         [this] { update(false); });
     if (scrcpy->detect(settings.scrcpy_path)) {
       path_changed();
       if (!updated && !startup)
@@ -769,13 +772,22 @@ public:
       ui->set_page(1);
       if (!startup)
         show();
-      status("Choose scrcpy.exe to get started. The app stays in your tray.");
+      status("Choose " + scrcpy_name + " to get started. The app stays in your tray.");
+    }
+    if (!desktop->tray_available()) {
+      // Without a tray host the window is the only way to reach the app.
+      log("[tray] No system tray found; keeping the window open.\n");
+      ui->set_pinned(true);
+      if (startup)
+        show();
     }
     if (updated) {
-      wchar_t local[32768]{};
-      GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
-      std::ifstream result(std::filesystem::path(local) /
+#ifdef _WIN32
+      std::ifstream result(app::from_utf8(app::environment("LOCALAPPDATA")) /
                            "scrcpy-pad/updates/result.txt");
+#else
+      std::ifstream result(update::state_directory() / "result.txt");
+#endif
       std::string message((std::istreambuf_iterator<char>(result)),
                           std::istreambuf_iterator<char>());
       log(message);
@@ -785,96 +797,66 @@ public:
     // The repository may not have releases yet; this is a normal update state.
     update(false);
   }
-  ~Controller() {
-    if (tray)
-      DestroyWindow(tray);
-    controller = nullptr;
-  }
 };
-LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-  if (!controller)
-    return DefWindowProcW(hwnd, msg, wp, lp);
-  static UINT taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
-  if (msg == taskbar_created) {
-    Shell_NotifyIconW(NIM_ADD, &controller->icon);
-    return 0;
-  }
-  if (msg == TrayMessage) {
-    if (lp == WM_LBUTTONUP) {
-      controller->show(true);
-      if (controller->visible)
-        controller->refresh(false, true);
-    } else if (lp == WM_RBUTTONUP) {
-      POINT point;
-      GetCursorPos(&point);
-      HMENU menu = CreatePopupMenu();
-      AppendMenuW(menu, MF_STRING, MirrorCommand, L"Quick Mirror");
-      AppendMenuW(menu, MF_STRING, ShowCommand, L"Show / hide");
-      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-      AppendMenuW(menu, MF_STRING, QuitCommand, L"Quit");
-      SetForegroundWindow(hwnd);
-      UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, point.x,
-                                    point.y, 0, hwnd, nullptr);
-      DestroyMenu(menu);
-      PostMessageW(hwnd, WM_NULL, 0, 0);
-      if (command == MirrorCommand)
-        controller->refresh(true);
-      else if (command == ShowCommand)
-        controller->show(true);
-      else if (command == QuitCommand)
-        controller->quit();
-    }
-    return 0;
-  }
-  if (msg == WM_HOTKEY && (int)wp == controller->hotkey_id) {
-    controller->refresh(true);
-    return 0;
-  }
-  if (msg == WM_COPYDATA) {
-    controller->show();
-    controller->refresh(true);
-    return 1;
-  }
-  return DefWindowProcW(hwnd, msg, wp, lp);
-}
 } // namespace
 
 int main(int argc, char **argv) {
-  bool startup = false, updated = false;
+  bool startup = false, updated = false, quick_mirror = false;
   for (int i = 1; i < argc; ++i) {
     startup |= std::string(argv[i]) == "--startup";
     updated |= std::string(argv[i]) == "--updated";
+    // Sent by compositor shortcuts on Linux; a first launch mirrors anyway.
+    quick_mirror |= std::string(argv[i]) == "--quick-mirror";
   }
-  HANDLE single = CreateMutexW(nullptr, FALSE, L"Local\\ScrcpyPadSlint");
-  if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    // Sign-in and installer launches must not activate an existing session.
-    if (!startup) {
-      if (HWND existing = FindWindowW(L"ScrcpyTrayMsgWnd", nullptr)) {
-        COPYDATASTRUCT data{};
-        SendMessageW(existing, WM_COPYDATA, 0, (LPARAM)&data);
-      }
-    }
-    if (single)
-      CloseHandle(single);
+  if (!desktop::claim_single_instance(startup, quick_mirror))
     return 0;
-  }
   int result = 0;
+#ifdef _WIN32
   HRESULT ole = OleInitialize(nullptr);
+#else
+  // A Slint build with GPU renderers would otherwise load GL drivers (~90 MB
+  // RSS); the software renderer is plenty for this panel. Users can override.
+  // Must precede any Slint call, since the first one selects the backend.
+  setenv("SLINT_BACKEND", "winit-software", 0);
+  // Matches scrcpy-gui.desktop and lets compositor rules target the window.
+  slint::set_xdg_app_id("scrcpy-gui");
+#endif
   try {
     auto app = std::make_shared<Controller>();
+#ifdef _WIN32
     app->initialize(updated, startup);
+#else
+    // Under winit on Wayland, a window shown before the event loop starts
+    // never draws its first frame, so initialize from inside the loop.
+    std::string failure;
+    slint::invoke_from_event_loop([&] {
+      try {
+        app->initialize(updated, startup);
+      } catch (const std::exception &e) {
+        failure = e.what();
+        slint::quit_event_loop();
+      }
+    });
+#endif
     slint::run_event_loop(slint::EventLoopMode::RunUntilQuit);
+    app->desktop.reset();
+#ifndef _WIN32
+    if (!failure.empty())
+      throw std::runtime_error(failure);
+#endif
   } catch (const std::exception &e) {
-    MessageBoxW(nullptr, app::wide(e.what()).c_str(), L"scrcpy-gui",
-                MB_OK | MB_ICONERROR);
+    desktop::show_error(e.what());
     result = 1;
   }
-  if (single)
-    CloseHandle(single);
+  desktop::release_single_instance();
+#ifdef _WIN32
   if (SUCCEEDED(ole))
     OleUninitialize();
+#endif
   return result;
 }
+#ifdef _WIN32
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   return main(__argc, __argv);
 }
+#endif

@@ -1,5 +1,5 @@
-#include "DeviceFiles.h"
-#include "AppCore.h"
+#include "device/DeviceFiles.h"
+#include "core/AppCore.h"
 #include <algorithm>
 #include <charconv>
 #include <stdexcept>
@@ -51,7 +51,7 @@ std::string device_parent(const std::string &path) {
   auto slash = normalized.rfind('/');
   return slash == 0 ? "/" : normalized.substr(0, slash);
 }
-DirectoryResult list_device_files(const std::wstring &adb, const std::string &serial,
+DirectoryResult list_device_files(const std::string &adb, const std::string &serial,
                                  const std::string &path, std::shared_ptr<Cancel> cancel) {
   DirectoryResult listing;
   try {
@@ -66,7 +66,7 @@ DirectoryResult list_device_files(const std::wstring &adb, const std::string &se
       "elif [ -f \"$f\" ]; then t=f; s=$(stat -L -c %s -- \"$f\") || exit; "
       "else continue; fi; printf '%s\\0%s\\0%s\\0' \"$t\" \"$s\" \"$f\"; "
       "done; printf 'SCRCPY_END\\0'; }";
-    auto result = run_process(adb, {L"-s", wide(serial), L"shell", L"-T", wide(script)}, {}, 30000, cancel);
+    auto result = run_process(adb, {"-s", serial, "shell", "-T", script}, {}, 30000, cancel);
     listing.error = command_error(result, cancel);
     if (!listing.error.empty() && result.text.find('\0') != std::string::npos)
       listing.error = "Could not finish reading this folder. Refresh or choose another path.";
@@ -102,7 +102,7 @@ DirectoryResult list_device_files(const std::wstring &adb, const std::string &se
   if (!listing.error.empty()) listing.files.clear();
   return listing;
 }
-std::string download_device_file(const std::wstring &adb, const std::string &serial,
+std::string download_device_file(const std::string &adb, const std::string &serial,
                                 const std::string &remote, const std::filesystem::path &local,
                                 std::shared_ptr<Cancel> cancel) {
   std::filesystem::path temporary;
@@ -111,25 +111,27 @@ std::string download_device_file(const std::wstring &adb, const std::string &ser
     static std::atomic<unsigned> next{0};
     // Reserve our own temporary path; never reuse someone else's partial file.
     for (;;) {
-      temporary = local.parent_path() / (L".scrcpy-" + std::to_wstring(GetCurrentProcessId()) +
-          L"-" + std::to_wstring(++next) + L".part");
-      HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-      if (file != INVALID_HANDLE_VALUE) { CloseHandle(file); break; }
-      if (GetLastError() != ERROR_FILE_EXISTS) return system_error();
+      temporary = local.parent_path() / (".scrcpy-" + std::to_string(process_id()) +
+          "-" + std::to_string(++next) + ".part");
+      bool exists = false;
+      auto failure = create_new_file(temporary, exists);
+      if (failure.empty()) break;
+      if (!exists) { temporary.clear(); return failure; }
     }
-    auto result = run_process(adb, {L"-s", wide(serial), L"pull", wide(path), temporary.wstring()}, {}, 0, cancel);
+    auto result = run_process(adb, {"-s", serial, "pull", path, to_utf8(temporary)}, {}, 0, cancel);
     auto error = command_error(result, cancel);
     if (cancel && cancel->requested) error = "Download cancelled.";
-    if (error.empty() && !MoveFileExW(temporary.c_str(), local.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-      error = system_error();
-    if (!error.empty()) DeleteFileW(temporary.c_str());
+    if (error.empty()) error = replace_file(temporary, local);
+    std::error_code ignored;
+    if (!error.empty()) std::filesystem::remove(temporary, ignored);
     return error;
   } catch (const std::exception &e) {
-    if (!temporary.empty()) DeleteFileW(temporary.c_str());
+    std::error_code ignored;
+    if (!temporary.empty()) std::filesystem::remove(temporary, ignored);
     return e.what();
   }
 }
-std::string upload_device_files(const std::wstring &adb, const std::string &serial,
+std::string upload_device_files(const std::string &adb, const std::string &serial,
                                const std::string &folder, const std::vector<std::filesystem::path> &files,
                                std::shared_ptr<Cancel> cancel, Output progress) {
   try {
@@ -137,15 +139,15 @@ std::string upload_device_files(const std::wstring &adb, const std::string &seri
     if (destination.back() != '/') destination += '/';
     if (files.empty()) return "Choose at least one file to upload.";
     for (const auto &file : files)
-      if (!std::filesystem::is_regular_file(file)) return "Only local files can be uploaded: " + utf8(file.wstring());
+      if (!std::filesystem::is_regular_file(file)) return "Only local files can be uploaded: " + to_utf8(file);
     size_t done = 0;
     for (const auto &file : files) {
       if (cancel && cancel->requested) return "Upload cancelled. Some files may already have been copied.";
-      if (progress) progress("Uploading " + std::to_string(++done) + "/" + std::to_string(files.size()) + ": " + utf8(file.filename().wstring()));
-      auto result = run_process(adb, {L"-s", wide(serial), L"push", std::filesystem::absolute(file).wstring(), wide(destination)}, {}, 0, cancel);
+      if (progress) progress("Uploading " + std::to_string(++done) + "/" + std::to_string(files.size()) + ": " + to_utf8(file.filename()));
+      auto result = run_process(adb, {"-s", serial, "push", to_utf8(std::filesystem::absolute(file)), destination}, {}, 0, cancel);
       auto error = command_error(result, cancel);
       if (cancel && cancel->requested) error = "Upload cancelled. A partial file may remain on the device.";
-      if (!error.empty()) return "Upload stopped at " + utf8(file.filename().wstring()) + ": " + error;
+      if (!error.empty()) return "Upload stopped at " + to_utf8(file.filename()) + ": " + error;
     }
     return {};
   } catch (const std::exception &e) { return e.what(); }

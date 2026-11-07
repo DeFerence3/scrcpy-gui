@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=scrcpy-gui
+GenericName=Android Screen Mirroring
+Comment=Tray app for mirroring and browsing Android devices with scrcpy
+Exec=scrcpy-ui
+Icon=scrcpy-gui
+Terminal=false
+Categories=Utility;
+Keywords=android;scrcpy;adb;mirror;
+StartupNotify=false

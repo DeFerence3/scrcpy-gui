@@ -1,5 +1,5 @@
-#include "Scrcpy.h"
-#include "DeviceFiles.h"
+#include "scrcpy/Scrcpy.h"
+#include "device/DeviceFiles.h"
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
@@ -11,11 +11,11 @@
 int main(int argc, char **argv) {
   try {
     if (argc < 2) throw std::runtime_error("Missing fixture");
-    auto dir = std::filesystem::current_path() / "backend-fixtures" / std::to_string(GetCurrentProcessId());
+    auto dir = std::filesystem::current_path() / "backend-fixtures" / std::to_string(app::process_id());
     std::filesystem::create_directories(dir / "space & path");
-    auto executable = dir / "space & path/scrcpy.exe";
+    auto executable = dir / "space & path" / (std::string("scrcpy") + app::executable_suffix);
     std::filesystem::copy_file(argv[1], executable);
-    std::filesystem::copy_file(argv[1], executable.parent_path() / "adb.exe");
+    std::filesystem::copy_file(argv[1], executable.parent_path() / (std::string("adb") + app::executable_suffix));
     std::mutex mutex; std::condition_variable cv;
     std::string log, failure; std::vector<app::Device> devices;
     std::set<std::string> active; bool listed = false; int finished = 0;
@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
         cv.notify_all();
       });
     auto require = [](bool okay, const char *message) { if (!okay) throw std::runtime_error(message); };
-    require(backend.set_path(executable.wstring()), "Could not set fixture path");
+    require(backend.set_path(app::to_utf8(executable)), "Could not set fixture path");
     backend.list_devices([&](std::vector<app::Device> value, std::string error) {
       std::lock_guard<std::mutex> lock(mutex); devices = value; failure = error; listed = true; cv.notify_all();
     });
@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     auto read = [](const std::filesystem::path &path) {
       std::ifstream input(path, std::ios::binary); return std::string(std::istreambuf_iterator<char>(input), {});
     };
-    auto local = dir / L"download & 雪.txt";
+    auto local = dir / app::from_utf8("download & 雪.txt");
     std::ofstream(local) << "existing";
     require(!app::download_device_file(adb, "USB123", "/fail.bin", local, {}).empty(), "Failed pull reported success");
     require(read(local) == "existing", "Failed pull overwrote local file");
@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
     require(app::download_device_file(adb, "USB123", "/sdcard/quote ' & 雪\nfile.txt", local, {}).empty(), "Pull failed");
     require(read(local) == "fixture download", "Successful pull content mismatch");
     for (const auto &entry : std::filesystem::directory_iterator(dir))
-      require(entry.path().extension() != L".part", "Download left a staging file behind");
+      require(entry.path().extension() != ".part", "Download left a staging file behind");
     auto second = dir / "second ' file.txt";
     std::ofstream(second) << "second file";
     require(app::upload_device_files(adb, "192.168.1.15:5555", "/sdcard/space ' & 雪", {local, second}, {}).empty(), "Multiple file upload failed");

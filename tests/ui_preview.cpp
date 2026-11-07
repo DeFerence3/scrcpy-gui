@@ -1,6 +1,6 @@
 #include "main.h"
-#include "../src/AppCore.h"
-#include "../src/DeviceModel.h"
+#include "../src/core/AppCore.h"
+#include "../src/device/DeviceModel.h"
 #include "slint-platform.h"
 #include <filesystem>
 #include <fstream>

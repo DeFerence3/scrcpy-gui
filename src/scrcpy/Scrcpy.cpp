@@ -1,67 +1,66 @@
-#include "Scrcpy.h"
+#include "scrcpy/Scrcpy.h"
 #include <algorithm>
-#include <cwctype>
+#include <cctype>
 #include <fstream>
 #include <thread>
 
 namespace {
-    bool is_file(const std::wstring &path) {
-      DWORD attrs = GetFileAttributesW(path.c_str());
-      return attrs != INVALID_FILE_ATTRIBUTES &&
-             !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-    }
-    std::wstring find_on_path(const wchar_t *name) {
-      wchar_t buffer[32768]{};
-      DWORD count = SearchPathW(nullptr, name, L".exe", 32768, buffer, nullptr);
-      return count && count < 32768 ? buffer : L"";
-    }
-} // namespace
+const std::string scrcpy_name = std::string("scrcpy") + app::executable_suffix;
+}
 
 Scrcpy::Scrcpy(Output output, Session session): output_(std::move(output)), session_(std::move(session)) {}
 
 Scrcpy::~Scrcpy() { stop(); }
-bool Scrcpy::set_path(std::wstring path) {
-  auto extension = std::filesystem::path(path).extension().wstring();
+bool Scrcpy::set_path(const std::string &value) {
+  auto path = app::from_utf8(value);
+#ifdef _WIN32
+  auto extension = app::to_utf8(path.extension());
   std::transform(extension.begin(), extension.end(), extension.begin(),
-                 [](wchar_t c) { return (wchar_t)std::towlower(c); });
-  if (!is_file(path) || extension != L".exe") {
-    output_("Select an existing scrcpy executable (.exe).\n");
+                 [](unsigned char c) { return (char)std::tolower(c); });
+  bool valid = app::is_file(path) && extension == ".exe";
+#else
+  std::error_code error;
+  auto permissions = std::filesystem::status(path, error).permissions();
+  bool valid = app::is_file(path) &&
+               (permissions & std::filesystem::perms::owner_exec) != std::filesystem::perms::none;
+#endif
+  if (!valid) {
+    output_("Select an existing " + scrcpy_name + " executable.\n");
     return false;
   }
-  path_ = std::filesystem::absolute(path).wstring();
-  output_("[scrcpy] " + app::utf8(path_) + "\n");
+  path_ = app::to_utf8(std::filesystem::absolute(path));
+  output_("[scrcpy] " + path_ + "\n");
   return true;
 }
 bool Scrcpy::detect(const std::string &saved) {
-  if (!saved.empty() && is_file(app::wide(saved)))
-    return set_path(app::wide(saved));
-  wchar_t env[32768]{};
-  if (auto size = GetEnvironmentVariableW(L"SCRCPY", env, 32768);
-      size && size < 32768 && is_file(env))
+  if (!saved.empty() && app::is_file(app::from_utf8(saved)))
+    return set_path(saved);
+  if (auto env = app::environment("SCRCPY"); !env.empty() && app::is_file(app::from_utf8(env)))
     return set_path(env);
-  auto found = find_on_path(L"scrcpy");
+  auto found = app::find_executable("scrcpy");
   if (!found.empty())
-    return set_path(found);
+    return set_path(app::to_utf8(found));
   std::ifstream legacy(app::config_directory() / "scrcpy_path.txt",
                        std::ios::binary);
   std::string old((std::istreambuf_iterator<char>(legacy)),
                   std::istreambuf_iterator<char>());
-  if (!old.empty() && is_file(app::wide(old)))
-    return set_path(app::wide(old));
-  output_("[scrcpy] Not found. Choose scrcpy.exe in Settings.\n");
+  if (!old.empty() && app::is_file(app::from_utf8(old)))
+    return set_path(old);
+  output_("[scrcpy] Not found. Choose " + scrcpy_name + " in Settings.\n");
   return false;
 }
-std::wstring Scrcpy::adb_path() const {
-  auto adjacent = std::filesystem::path(path_).parent_path() / "adb.exe";
-  if (!path_.empty() && is_file(adjacent.wstring()))
-    return adjacent.wstring();
-  auto found = find_on_path(L"adb");
-  return found.empty() ? L"adb.exe" : found;
+std::string Scrcpy::adb_path() const {
+  auto adjacent = app::from_utf8(path_).parent_path() / (std::string("adb") + app::executable_suffix);
+  if (!path_.empty() && app::is_file(adjacent))
+    return app::to_utf8(adjacent);
+  auto found = app::find_executable("adb");
+  // A bare name is resolved through PATH at launch time.
+  return found.empty() ? std::string("adb") + app::executable_suffix : app::to_utf8(found);
 }
 void Scrcpy::version(std::function<void(std::string)> done) const {
   auto path = path_;
   std::thread([path, done] {
-    auto result = app::run_process(path, {L"--version"}, {}, 5000);
+    auto result = app::run_process(path, {"--version"}, {}, 5000);
     auto line = app::trim(result.text.substr(0, result.text.find('\n')));
     done(result.code == 0 ? line : "scrcpy version unavailable");
   }).detach();
@@ -69,7 +68,7 @@ void Scrcpy::version(std::function<void(std::string)> done) const {
 void Scrcpy::list_devices(Devices done) const {
   auto adb = adb_path();
   std::thread([adb, done] {
-    auto result = app::run_process(adb, {L"devices", L"-l"});
+    auto result = app::run_process(adb, {"devices", "-l"});
     done(result.code == 0 ? app::parse_devices(result.text)
                           : std::vector<app::Device>{},
          result.code == 0 ? "" : app::trim(result.text));
@@ -80,14 +79,14 @@ void Scrcpy::restart_adb(std::function<void()> done) const {
   auto output = output_;
   std::thread([adb, output, done] {
     output("[adb] Restarting server...\n");
-    app::run_process(adb, {L"kill-server"}, output);
-    app::run_process(adb, {L"start-server"}, output);
+    app::run_process(adb, {"kill-server"}, output);
+    app::run_process(adb, {"start-server"}, output);
     done();
   }).detach();
 }
 bool Scrcpy::start(const std::string &serial, const std::string &arguments) {
   if (path_.empty() || serial.empty()) {
-    output_("Choose scrcpy.exe and a ready device first.\n");
+    output_("Choose " + scrcpy_name + " and a ready device first.\n");
     return false;
   }
   std::string error;
@@ -96,7 +95,7 @@ bool Scrcpy::start(const std::string &serial, const std::string &arguments) {
     output_(error + "\n");
     return false;
   }
-  args.insert(args.begin(), L"--serial=" + app::wide(serial));
+  args.insert(args.begin(), "--serial=" + serial);
   auto cancel = std::make_shared<app::Cancel>();
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
@@ -115,7 +114,7 @@ bool Scrcpy::start(const std::string &serial, const std::string &arguments) {
   std::thread([state, path, args, output, session, serial, cancel] {
     auto result =
         app::run_process(path, args, output, 0, cancel,
-                         std::filesystem::path(path).parent_path().wstring());
+                         app::from_utf8(path).parent_path());
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->sessions.erase(serial);

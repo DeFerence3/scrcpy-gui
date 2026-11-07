@@ -1,9 +1,10 @@
-#include "Platform.h"
-#include "AppCore.h"
+#include "platform/Platform.h"
+#include "core/AppCore.h"
 #include <shellapi.h>
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <stdexcept>
 
 namespace app {
 namespace {
@@ -15,10 +16,15 @@ struct Handle {
   Handle(const Handle &) = delete;
   Handle &operator=(const Handle &) = delete;
 };
-std::wstring command_line(const std::wstring &exe, const std::vector<std::wstring> &args) {
+std::wstring command_line(const std::wstring &exe, const std::vector<std::string> &args) {
   auto line = quote_arg(exe);
-  for (const auto &arg : args) line += L" " + quote_arg(arg);
+  for (const auto &arg : args) line += L" " + quote_arg(wide(arg));
   return line;
+}
+std::string system_error(DWORD code) {
+  wchar_t buffer[1024]{};
+  FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, 0, buffer, 1024, nullptr);
+  return trim(utf8(buffer)) + " (" + std::to_string(code) + ")";
 }
 }
 std::wstring wide(const std::string &value) {
@@ -33,11 +39,8 @@ std::string utf8(const std::wstring &value) {
   WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(), result.data(), count, nullptr, nullptr);
   return result;
 }
-std::string system_error(DWORD code) {
-  wchar_t buffer[1024]{};
-  FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, 0, buffer, 1024, nullptr);
-  return trim(utf8(buffer)) + " (" + std::to_string(code) + ")";
-}
+std::string last_error() { return system_error(GetLastError()); }
+unsigned long process_id() { return GetCurrentProcessId(); }
 std::wstring quote_arg(const std::wstring &value) {
   std::wstring out = L"\"";
   size_t backslashes = 0;
@@ -51,45 +54,46 @@ std::wstring quote_arg(const std::wstring &value) {
   out.append(backslashes * 2, L'\\');
   return out + L'"';
 }
-std::vector<std::wstring> template_args(const std::string &text, std::string &error) {
-  if (text.size() > 4096 || text.find_first_of("\r\n") != std::string::npos) {
-    error = "Arguments must be a single line of at most 4096 characters."; return {};
-  }
-  // Reject unmatched quotes before using Windows' standard argv parser.
-  bool quoted = false;
-  size_t slashes = 0;
-  for (char c : text) {
-    if (c == '"' && slashes % 2 == 0) quoted = !quoted;
-    slashes = c == '\\' ? slashes + 1 : 0;
-  }
-  if (quoted) { error = "Close the quoted argument before saving."; return {}; }
-  int count = 0;
-  auto argv = CommandLineToArgvW((L"scrcpy " + wide(text)).c_str(), &count);
-  if (!argv) { error = system_error(); return {}; }
-  std::vector<std::wstring> result;
-  for (int i=1; i<count; ++i) {
-    std::wstring arg = argv[i];
-    auto name = arg.substr(0, arg.find(L'='));
-    if (name == L"--serial" || name == L"--select-usb" || name == L"--select-tcpip" || name == L"--tcpip"
-        || name == L"-d" || name == L"-e" || arg.rfind(L"-s", 0) == 0) {
-      error = "Choose devices in the Devices tab; remove device-selection arguments.";
-      break;
-    }
-    result.push_back(std::move(arg));
-  }
-  LocalFree(argv);
-  return error.empty() ? result : std::vector<std::wstring>{};
+std::string environment(const char *name) {
+  std::vector<wchar_t> value(32768);
+  DWORD size = GetEnvironmentVariableW(wide(name).c_str(), value.data(), (DWORD)value.size());
+  return size && size < value.size() ? utf8(value.data()) : std::string{};
 }
 std::filesystem::path config_directory() {
-  wchar_t dir[32768]{};
-  DWORD size = GetEnvironmentVariableW(L"APPDATA", dir, 32768);
-  if (!size || size >= 32768) throw std::runtime_error("APPDATA is unavailable.");
-  return std::filesystem::path(dir) / "scrcpy-tray";
+  auto dir = environment("APPDATA");
+  if (dir.empty()) throw std::runtime_error("APPDATA is unavailable.");
+  return from_utf8(dir) / "scrcpy-tray";
 }
 std::filesystem::path executable_directory() {
-  wchar_t path[32768]{};
-  GetModuleFileNameW(nullptr, path, 32768);
-  return std::filesystem::path(path).parent_path();
+  std::vector<wchar_t> path(32768);
+  GetModuleFileNameW(nullptr, path.data(), (DWORD)path.size());
+  return std::filesystem::path(path.data()).parent_path();
+}
+bool is_file(const std::filesystem::path &path) {
+  DWORD attrs = GetFileAttributesW(path.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+std::filesystem::path find_executable(const std::string &name) {
+  std::vector<wchar_t> buffer(32768);
+  DWORD count = SearchPathW(nullptr, wide(name).c_str(), L".exe", (DWORD)buffer.size(), buffer.data(), nullptr);
+  return count && count < buffer.size() ? std::filesystem::path(buffer.data()) : std::filesystem::path{};
+}
+std::string create_new_file(const std::filesystem::path &path, bool &exists) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  exists = file == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_EXISTS;
+  if (file == INVALID_HANDLE_VALUE) return exists ? "File exists." : last_error();
+  CloseHandle(file);
+  return {};
+}
+std::string replace_file(const std::filesystem::path &from, const std::filesystem::path &to) {
+  if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return {};
+  return last_error();
+}
+bool open_url(const std::string &url, std::string &error) {
+  auto result = ShellExecuteW(nullptr, L"open", wide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(result) > 32) return true;
+  error = "ShellExecute failed.";
+  return false;
 }
 bool parse_hotkey(const std::string &text, UINT &modifiers, UINT &key, std::string &canonical) {
   modifiers = 0; key = 0; canonical.clear();
@@ -118,25 +122,27 @@ bool parse_hotkey(const std::string &text, UINT &modifiers, UINT &key, std::stri
   canonical += key >= VK_F1 && key <= VK_F24 ? "F" + std::to_string(key - VK_F1 + 1) : std::string(1, (char)key);
   return true;
 }
-ProcessResult run_process(const std::wstring &exe, const std::vector<std::wstring> &args,
-                         Output output, DWORD timeout_ms, std::shared_ptr<Cancel> cancel, const std::wstring &directory) {
+ProcessResult run_process(const std::string &executable, const std::vector<std::string> &args,
+                         Output output, unsigned timeout_ms, std::shared_ptr<Cancel> cancel,
+                         const std::filesystem::path &directory) {
   ProcessResult result;
+  auto exe = wide(executable);
   auto fail = [&](const std::string &message) { result.text += message + "\n"; if (output) output(message + "\n"); };
   SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
   HANDLE read = nullptr, write = nullptr;
-  if (!CreatePipe(&read, &write, &security, 0)) { fail(system_error()); return result; }
+  if (!CreatePipe(&read, &write, &security, 0)) { fail(last_error()); return result; }
   Handle reader(read), writer(write);
-  if (!SetHandleInformation(reader.value, HANDLE_FLAG_INHERIT, 0)) { fail(system_error()); return result; }
+  if (!SetHandleInformation(reader.value, HANDLE_FLAG_INHERIT, 0)) { fail(last_error()); return result; }
   Handle input(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0, nullptr));
-  if (input.value == INVALID_HANDLE_VALUE) { fail(system_error()); return result; }
+  if (input.value == INVALID_HANDLE_VALUE) { fail(last_error()); return result; }
   SIZE_T bytes = 0;
   InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
   std::vector<unsigned char> storage(bytes);
   auto attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
-  if (!InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) { fail(system_error()); return result; }
+  if (!InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) { fail(last_error()); return result; }
   HANDLE inherited[] = {writer.value, input.value};
   if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr)) {
-    fail(system_error()); DeleteProcThreadAttributeList(attributes); return result;
+    fail(last_error()); DeleteProcThreadAttributeList(attributes); return result;
   }
   STARTUPINFOEXW startup{};
   startup.StartupInfo.cb = sizeof(startup);
@@ -150,22 +156,23 @@ ProcessResult run_process(const std::wstring &exe, const std::vector<std::wstrin
   // a mirror (or completing `adb devices`) cannot kill other apps' ADB sessions.
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
   if (!job.value || !SetInformationJobObject(job.value, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
-    fail(system_error()); DeleteProcThreadAttributeList(attributes); return result;
+    fail(last_error()); DeleteProcThreadAttributeList(attributes); return result;
   }
   PROCESS_INFORMATION info{};
   auto line = command_line(exe, args);
+  auto dir = directory.wstring();
   // CreateProcess (never cmd.exe): template arguments cannot execute shell commands.
   BOOL started = CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, TRUE,
     CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr,
-    directory.empty() ? nullptr : directory.c_str(), &startup.StartupInfo, &info);
+    dir.empty() ? nullptr : dir.c_str(), &startup.StartupInfo, &info);
   DWORD launch_error = GetLastError();
   DeleteProcThreadAttributeList(attributes);
-  if (!started) { fail("Could not start " + utf8(exe) + ": " + system_error(launch_error)); return result; }
+  if (!started) { fail("Could not start " + executable + ": " + system_error(launch_error)); return result; }
   Handle process(info.hProcess), thread(info.hThread);
   if (!AssignProcessToJobObject(job.value, process.value)) {
-    fail(system_error()); TerminateProcess(process.value, 1); return result;
+    fail(last_error()); TerminateProcess(process.value, 1); return result;
   }
-  if (ResumeThread(thread.value) == (DWORD)-1) { fail(system_error()); TerminateProcess(process.value, 1); return result; }
+  if (ResumeThread(thread.value) == (DWORD)-1) { fail(last_error()); TerminateProcess(process.value, 1); return result; }
   writer.close(); input.close();
   auto began = GetTickCount64();
   std::string pending;
@@ -201,15 +208,18 @@ ProcessResult run_process(const std::wstring &exe, const std::vector<std::wstrin
     }
   }
   if (output && !pending.empty()) output(pending + "\n");
-  GetExitCodeProcess(process.value, &result.code);
+  DWORD code = 1;
+  GetExitCodeProcess(process.value, &code);
+  result.code = (int)code;
   return result;
 }
-bool launch_detached(const std::wstring &exe, const std::vector<std::wstring> &args, std::string &error) {
+bool launch_detached(const std::string &executable, const std::vector<std::string> &args, std::string &error) {
+  auto exe = wide(executable);
   auto line = command_line(exe, args);
   STARTUPINFOW startup{}; startup.cb = sizeof(startup);
   PROCESS_INFORMATION info{};
   if (!CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info)) {
-    error = system_error(); return false;
+    error = last_error(); return false;
   }
   CloseHandle(info.hProcess); CloseHandle(info.hThread); return true;
 }
