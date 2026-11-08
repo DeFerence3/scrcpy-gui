@@ -107,13 +107,13 @@ void startup_case(const std::filesystem::path &exe) {
   Child child(exe);
   wait_for_tray(child);
   require_hidden(child, 2000);
-  auto duplicate = app::run_process(exe.wstring(), {L"--startup"}, {}, 3000);
+  auto duplicate = app::run_process(app::to_utf8(exe), {"--startup"}, {}, 3000);
   require(duplicate.code == 0 && !duplicate.timed_out,
           "Duplicate startup did not exit successfully");
   require_hidden(child, 1000);
 
   // Manual activation must still work after a quiet sign-in launch.
-  auto manual = app::run_process(exe.wstring(), {}, {}, 3000);
+  auto manual = app::run_process(app::to_utf8(exe), {}, {}, 3000);
   require(manual.code == 0 && !manual.timed_out, "Manual activation failed");
   bool shown = false;
   for (int attempt = 0; attempt < 80 && !shown; ++attempt) {
