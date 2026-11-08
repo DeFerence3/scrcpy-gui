@@ -2,9 +2,6 @@ name: Build and release distribution
 
 on:
   push:
-    # Tags can restore default-branch caches, but not another tag's cache.
-    branches:
-      - master
     tags:
       - 'v*'
   workflow_dispatch:

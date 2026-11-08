@@ -25,6 +25,7 @@ Other directories:
 
 - `ui/main.slint` defines the interface, reusable controls, and theme. No separate asset directory is present.
 - `tests/` contains core/backend checks, a mock tool executable, updater fixtures, and headless UI previews.
+- `README.md` is for users. `docs/` holds the detailed guides: `features.md`, `architecture.md`, `build-windows.md` and `build-linux.md`, plus screenshots in `docs/images/` (rendered by `scrcpy-ui-preview`). Update the matching doc when behavior, layout or build steps change.
 - `scripts/update.ps1` implements Windows updates; `packaging/linux/` holds the `.desktop` entry and icon; `cmake/` contains the MSVC environment helper. Root `CMakeLists.txt` defines targets, tests, and packaging.
 - Keep generated code, binaries, and fetched dependencies inside build directories; do not commit them.
 

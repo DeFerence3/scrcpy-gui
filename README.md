@@ -1,157 +1,181 @@
+<div align="center">
+
+<img src="packaging/linux/scrcpy-gui.svg" alt="scrcpy-gui logo" width="88">
+
 # scrcpy-gui
 
-A compact tray app for [scrcpy](https://github.com/Genymobile/scrcpy), built with C++ and Slint. Mirror and control Android devices, manage scrcpy presets, and start sessions with a keyboard shortcut.
+**Mirror and control your Android phone from the system tray with one click.**
 
-Supports **Windows** and **Linux** (tested on Hyprland). Install scrcpy and ADB separately; they are not bundled with this app. See [Linux](#linux) for what differs there.
+A small, fast tray app for [scrcpy](https://github.com/Genymobile/scrcpy) on Windows and Linux.
 
-## Use
+[![Latest release](https://img.shields.io/github/v/release/DeFerence3/scrcpy-gui-slint?label=download&sort=semver)](https://github.com/DeFerence3/scrcpy-gui-slint/releases/latest)
+[![Build](https://github.com/DeFerence3/scrcpy-gui-slint/actions/workflows/distribution.yml/badge.svg)](https://github.com/DeFerence3/scrcpy-gui-slint/actions/workflows/distribution.yml)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-informational)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE.txt)
 
-1. Install scrcpy with its included `adb.exe`.
-2. Install the GUI setup package, or extract the portable ZIP and run `scrcpy-ui.exe`. The installer starts the app in the tray and enables startup at sign-in.
-3. Enable USB debugging on your Android device, connect it, and accept the authorization prompt.
-4. Open the tray icon. Click the **Settings gear** beside the pin icon and browse to `scrcpy.exe` if it was not detected automatically.
-5. In **Devices**, click the template name on a device card to start mirroring, or click its dropdown arrow and choose another template to start that configuration. The control changes to Stop while mirroring.
+[Download](#download) · [Quick start](#quick-start) · [Features](docs/features.md) · [FAQ](#faq) · [Build from source](#build-from-source)
 
-Use **Make Default** in **Manage templates** to choose the preset for device buttons and **Quick Mirror**. The default shortcut is **Ctrl + Alt + S**; with multiple ready devices, the app asks you to choose one.
+<br>
 
-Closing the window hides it to the tray and resets it to **Devices** for the next opening. The **pin icon** keeps it open when focus changes and highlights while pinned; **Quit app** exits. Portable copies do not enable startup at sign-in.
+<img src="docs/images/devices.png" alt="Devices" width="260">&nbsp;
+<img src="docs/images/files.png" alt="File explorer" width="260">&nbsp;
+<img src="docs/images/templates.png" alt="Templates" width="260">
 
-Click the **folder icon** to the left of Mirror to explore a device's files inside the tray panel. The header and version footer stay visible; the **back arrow** returns to devices. Browsing starts at `/sdcard`. Use the **up**, **home**, and **refresh** icons to navigate, or enter an absolute path and press Enter. The arrow beside a folder opens it; the **download icon** beside a file opens Save As. Drop local files into the panel, or use the **upload icon**, to copy them into the open folder. The Files page stays visible when focus changes so you can drag from Windows Explorer. Hover over an icon for its label. Existing files prompt before replacement. Use the **cancel icon** to stop a transfer; an interrupted upload may leave a partial file on the device. Android's normal ADB storage permissions apply.
+</div>
 
-## Features
+---
 
-- Discover USB and wireless devices connected through ADB, with connection and authorization status.
-- Mirror multiple devices and stop sessions individually or together.
-- Browse device storage, download files, and upload files by drag and drop.
-- Create, edit, and save scrcpy argument templates, including resolution, frame rate, and audio preferences.
-- Customize the global Quick Mirror shortcut.
-- Keep the app in the tray, with optional window pinning and automatic startup through the installer.
-- View logs, detect scrcpy on PATH, and restart ADB from Settings.
-- Check for GUI updates from `DeFerence3/scrcpy-gui-slint`, or enable automatic updates. These updates do not replace scrcpy.
+## Why scrcpy-gui?
 
-Preferences are stored in `%APPDATA%\scrcpy-tray\settings.dat`.
+[scrcpy](https://github.com/Genymobile/scrcpy) is excellent, but it runs from the command line. You type `adb devices`, remember the right flags, and do it again for each phone. scrcpy-gui puts all of that in your tray:
 
-## Linux
+- 🖱️ **One-click mirroring.** Click a device and its screen appears on your desktop.
+- ⌨️ **One key to start.** Press **Ctrl + Alt + S** (Windows) or your own key binding (Linux) to mirror the connected phone without opening anything.
+- 🎛️ **Saved presets.** Keep your favorite scrcpy options (1080p60, light Wi-Fi mode, no audio, …) and switch between them from a dropdown.
+- 📱 **Several devices at once.** USB and wireless devices, each in its own window, each stopped on its own.
+- 📂 **Built-in file transfer.** Browse the phone's storage, download files, and upload by dragging them onto the panel.
+- 🪶 **Light.** A native C++ app of a few megabytes. No browser engine, almost no memory use, instant start.
+- 🔄 **Updates itself.** Optional automatic updates, each download checked against its SHA-256 digest.
 
-The Linux build uses no GUI toolkit besides Slint: the tray icon is a StatusNotifierItem over D-Bus (shown by Waybar, Quickshell/Omarchy, KDE and similar bars), and file dialogs use `xdg-desktop-portal`. It needs `libsystemd`, `libwayland-client`, a session D-Bus, and a portal backend with a file chooser such as `xdg-desktop-portal-gtk`.
+See **[docs/features.md](docs/features.md)** for a full tour of every feature.
 
-- Left-click the tray icon to show or hide the panel; right-click for **Quick Mirror**, **Show / hide** and **Quit**.
-- On Hyprland the app sets its own window rule at startup over Hyprland's IPC socket, so the panel floats in the top-right corner beside the tray, pinned across workspaces. It sets the rule again after `hyprctl reload`. Other Wayland compositors decide placement themselves; add a float rule for the app id (class) `scrcpy-gui` there.
-- Drag files from your file manager onto the **Files** page to upload them to the open device folder (Wayland sessions).
-- The panel stays open when it loses focus; close it with **×** or the tray icon.
-- Preferences are stored in `$XDG_CONFIG_HOME/scrcpy-tray/settings.dat` (usually `~/.config/scrcpy-tray/`).
+## Download
 
-### Keyboard shortcut
+Get the latest version from the **[Releases page](https://github.com/DeFerence3/scrcpy-gui-slint/releases/latest)**:
 
-Wayland does not let apps grab global keys, and the app never changes your compositor's key bindings. Instead, bind a key to this command:
+| Platform | File | Notes |
+|---|---|---|
+| **Windows** (installer) | `scrcpy-gui-windows-x64.exe` | Recommended. No admin rights needed. Starts with Windows. |
+| **Windows** (portable) | `scrcpy-gui-windows-x64.zip` | Extract anywhere and run `scrcpy-ui.exe`. |
+| **Linux** x64 | `scrcpy-gui-linux-x64.tar.gz` | Extract into `~/.local`. Needs glibc 2.35+ (Ubuntu 22.04 or newer). |
 
-```sh
-scrcpy-ui --quick-mirror
-```
+> [!IMPORTANT]
+> scrcpy-gui **does not include scrcpy or ADB**. Install them first:
+> - **Windows:** download [scrcpy for Windows](https://github.com/Genymobile/scrcpy/blob/master/doc/windows.md) (it includes `adb.exe`), or run `winget install Genymobile.scrcpy`.
+> - **Linux:** install `scrcpy` and `adb`/`android-tools` from your package manager, or see [scrcpy on Linux](https://github.com/Genymobile/scrcpy/blob/master/doc/linux.md).
 
-When the app is running, this asks it to run **Quick Mirror** and then exits immediately: with exactly one ready device, mirroring starts right away; otherwise the panel opens so you can choose a device. When the app is not running, the command starts it and runs Quick Mirror. Plain `scrcpy-ui` shows the panel and starts Quick Mirror; `scrcpy-ui --startup` starts in the tray without showing anything (for autostart).
+### Install on Windows
 
-Use the full path (for example `~/.local/bin/scrcpy-ui`) if the install folder is not on the compositor's `PATH`. Examples:
+Run the installer. The app starts in the tray right away and starts again each time you sign in. If you use the portable ZIP, keep all the extracted files together.
 
-- **Hyprland, Lua config** (Omarchy, in `~/.config/hypr/bindings.lua` and `autostart.lua`):
-
-  ```lua
-  o.bind("SUPER + CTRL + M", "Quick Mirror", "scrcpy-ui --quick-mirror")
-  o.launch_on_start("scrcpy-ui --startup")
-  ```
-
-  Without Omarchy's helpers: `hl.bind("SUPER + CTRL + M", hl.dsp.exec_cmd("scrcpy-ui --quick-mirror"))`.
-- **Hyprland, `hyprland.conf`**:
-
-  ```ini
-  bind = SUPER CTRL, M, exec, scrcpy-ui --quick-mirror
-  exec-once = scrcpy-ui --startup
-  ```
-
-- **Sway / i3** (`~/.config/sway/config`):
-
-  ```
-  bindsym $mod+Ctrl+m exec scrcpy-ui --quick-mirror
-  exec scrcpy-ui --startup
-  ```
-
-- **GNOME**: Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts, with the command above.
-- **KDE Plasma**: System Settings → Keyboard → Shortcuts → Add New → Command or Script.
-
-Pick a free combination; check what is taken with `hyprctl binds` (Omarchy already uses Super + Alt + S).
-
-### Updates
-
-Release tarballs (`scrcpy-gui-linux-x64.tar.gz`) update themselves like the Windows app: **Settings → Check updates** downloads the newest GitHub release, verifies its SHA-256 digest, and replaces the files in place before restarting. This needs `curl`, `tar` and `sha256sum`, and an installation you can write to without `sudo`, such as `~/.local`. Copies installed under `/usr`, into a folder you cannot write to, or run from a build folder only report that an update is available; update those the way you installed them.
-
-To install a release tarball into `~/.local`:
+### Install on Linux
 
 ```sh
 tar -xzf scrcpy-gui-linux-x64.tar.gz -C ~/.local
+~/.local/bin/scrcpy-ui
 ```
 
-### Build from source
+This adds **scrcpy-gui** to your app launcher. You also need:
 
-Build requirements: CMake 3.21+, Ninja, a C++17 compiler, Rust (to build Slint), `pkg-config`, and the `libsystemd` and `wayland` headers. On Arch: `sudo pacman -S cmake ninja rust scrcpy`.
+- a tray that supports StatusNotifierItem (Waybar, Quickshell/Omarchy, KDE Plasma, or GNOME with the AppIndicator extension), and
+- an `xdg-desktop-portal` backend for file dialogs (for example `xdg-desktop-portal-gtk`).
+
+## Quick start
+
+1. **Enable USB debugging** on your phone: *Settings → About phone →* tap **Build number** 7 times, then *Developer options →* **USB debugging**.
+2. **Connect the phone** by USB, unlock it, and tap **Allow** on the *Allow USB debugging?* prompt.
+3. **Open scrcpy-gui** from the tray icon. Your phone appears under **Your devices**.
+4. **Click the template button** on the device card (for example *Default (1080p, 60fps)*). The phone's screen opens in a new window, and you can control it with your mouse and keyboard.
+5. **Click Stop** (or close the scrcpy window) when you're done.
+
+If scrcpy isn't found, open **Settings** (gear icon) and click **Browse…** to point to `scrcpy.exe` or `scrcpy`.
+
+### Set up a shortcut
+
+- **Windows:** **Ctrl + Alt + S** works out of the box. Change it in **Settings → Keyboard shortcut**.
+- **Linux:** Wayland doesn't let apps grab keys, so bind a key in your desktop to this command:
+
+  ```sh
+  scrcpy-ui --quick-mirror
+  ```
+
+  Hyprland example: `bind = SUPER CTRL, M, exec, scrcpy-ui --quick-mirror`. To start the app at login, add `scrcpy-ui --startup` to your autostart. See [more examples](docs/features.md#linux) for Sway, i3, GNOME and KDE.
+
+With one phone connected, the shortcut starts mirroring right away. With several, the app asks which one to use.
+
+## Tips
+
+- **Mirror over Wi-Fi.** Pair the phone with `adb pair` / `adb connect` (or Android's *Wireless debugging*). It then appears in the list like a USB device.
+- **Use a different preset once.** Click the **▾ arrow** next to the mirror button and pick a template.
+- **Create your own presets.** **Settings → Manage templates** takes any [scrcpy option](https://github.com/Genymobile/scrcpy#user-documentation), for example `--turn-screen-off --stay-awake`.
+- **Keep the panel open.** Click the **pin** icon.
+- **Move files.** Click the **folder icon** on a device, then drag files onto the panel to upload, or click the download icon next to a file.
+
+## FAQ
+
+<details>
+<summary><b>My phone doesn't appear, or shows "unauthorized".</b></summary>
+
+Unlock the phone and accept the *Allow USB debugging?* prompt. If it doesn't appear, unplug and reconnect the phone, try another cable or port (some cables only charge), or click **Settings → Restart ADB**. On Windows, some phones need their manufacturer's USB driver.
+</details>
+
+<details>
+<summary><b>The app says scrcpy wasn't found.</b></summary>
+
+Install scrcpy (see [Download](#download)), then use **Settings → Detect PATH** or **Browse…** to pick the scrcpy executable. The app uses the `adb` that comes with scrcpy when there is one.
+</details>
+
+<details>
+<summary><b>Mirroring starts and closes immediately.</b></summary>
+
+Read the **Activity log** at the bottom of the panel; it shows scrcpy's error message. Common causes are a locked screen, an option your phone doesn't support (try the *Lightweight* template), or audio capture on Android 10 and older (add `--no-audio`).
+</details>
+
+<details>
+<summary><b>Linux: there is no tray icon.</b></summary>
+
+Your bar or desktop needs StatusNotifierItem support, for example Waybar's `tray` module, KDE, or GNOME with the *AppIndicator* extension. Without a tray, the panel stays open so you can still use the app.
+</details>
+
+<details>
+<summary><b>Linux: the panel opens as a tiled window.</b></summary>
+
+On Hyprland the app places itself automatically (floating, top right, on every workspace). On other compositors, add a float rule for the app id `scrcpy-gui`.
+</details>
+
+<details>
+<summary><b>Does updating the app also update scrcpy?</b></summary>
+
+No. **Settings → Check updates** updates scrcpy-gui only. Update scrcpy the way you installed it. On Linux, self-updating works for tarball installs in a folder you can write to, such as `~/.local`.
+</details>
+
+<details>
+<summary><b>Where are my settings stored? How do I reset them?</b></summary>
+
+Windows: `%APPDATA%\scrcpy-tray\settings.dat`. 
+
+Linux: `~/.config/scrcpy-tray/settings.dat`. Quit the app and delete the file to reset everything.
+</details>
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [Features](docs/features.md) | Every feature in detail, with platform differences |
+| [Architecture](docs/architecture.md) | How the app is built, and why C++ and Slint |
+| [Build on Windows](docs/build-windows.md) | Building, testing and packaging on Windows |
+| [Build on Linux](docs/build-linux.md) | Building, testing, installing and packaging on Linux |
+
+## Build from source
 
 ```sh
+git clone https://github.com/DeFerence3/scrcpy-gui-slint.git
+cd scrcpy-gui-slint
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure
-./build/app/scrcpy-ui
-cmake --install build --component gui --prefix ~/.local --strip   # binary, Slint library, .desktop entry, icon
-cpack --config build/CPackConfig.cmake -B build/packages            # release tarball
 ```
 
-## Build locally
+You need CMake 3.21+, Ninja, a C++17 compiler and Rust, plus a few platform libraries. See the full guides for **[Windows](docs/build-windows.md)** and **[Linux](docs/build-linux.md)**.
 
-These steps are for Windows; see [Linux](#linux) for Linux builds.
+## Contributing
 
-Requirements: Windows, Git, CMake 3.21+, Ninja, and Visual Studio C++ build tools with the Windows SDK. Install stable Rust if building Slint from source. CMake uses an installed Slint package when available; otherwise it downloads and builds Slint.
+Bug reports, ideas and pull requests are welcome. Please [open an issue](https://github.com/DeFerence3/scrcpy-gui-slint/issues) first for larger changes. Before you send code, read [docs/architecture.md](docs/architecture.md) for the project layout and rules, and run `ctest --test-dir build --output-on-failure`. For UI changes, include screenshots or the rendered previews from `build/ui-previews`.
 
-From the repository directory in **Visual Studio Developer PowerShell**:
+## Acknowledgements
 
-For a Debug build that stops the previous local instance and launches the app, run `./run.ps1`. The script configures the build automatically, builds the app target and its dependencies, and stops on errors. Use `./run.ps1 -Configuration Release` for Release. The commands below also build the test targets.
+- [scrcpy](https://github.com/Genymobile/scrcpy) by Genymobile, which does all the real mirroring work
+- [Slint](https://slint.dev), the UI toolkit this app is built with
 
-```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-    -DSLINT_FEATURE_BACKEND_QT=OFF `
-    -DSLINT_FEATURE_RENDERER_SKIA=OFF `
-    -DSLINT_FEATURE_RENDERER_SOFTWARE=ON
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
-.\build\app\scrcpy-ui.exe
-```
+## License
 
-Quit any running copy before testing or launching the new build. Keep the executable, runtime DLLs, and `update.ps1` together.
-
-If your build directory uses a Visual Studio generator, build with `--config Release`, test with `-C Release`, and launch `.\build\app\Release\scrcpy-ui.exe`.
-
-To create distribution packages:
-
-```powershell
-# Portable ZIP
-cpack --config build/CPackConfig.cmake -C Release -G ZIP -B build/packages
-
-# Installer (requires NSIS)
-cpack --config build/CPackConfig.cmake -C Release -G NSIS -B build/packages
-```
-
-Packages are written to `build/packages`. To set the app and package version, add `"-DSCRCPY_VERSION=0.1.1"` when configuring CMake.
-
-## Publish a release
-
-Push a new version tag on the commit to release:
-
-```powershell
-git tag v0.0.3
-git push origin v0.0.3
-```
-
-Use `vMAJOR.MINOR.PATCH` (or `vMAJOR.MINOR.PATCH.REVISION`) and a version higher than the previous release. The distribution workflow builds and tests Windows x64 and Linux x64, packages the portable ZIP, the installer and the Linux tarball, then publishes a GitHub release with all three packages and `SHA256SUMS.txt`. The app version comes from the tag. Publishing uses the repository's `PAT` Actions secret, which must have write access to repository contents (or the `repo` scope for a classic PAT).
-
-Pushes to `master` also build and test the app to warm the compiled Slint SDK cache. Let that run finish before pushing a release tag: GitHub lets tags restore default-branch caches, but isolates caches created by different tags. A cache hit skips the Slint checkout, Rust setup, and Slint build; the app and tests always build from the checked-out source. The cache key includes the platform, pinned Slint/Rust versions, and workflow hash, so changes to SDK build options invalidate it. Cache misses (including eviction) rebuild the SDK automatically. Use **Actions → Build and release distribution → Run workflow** on `master` to warm it manually; branch and manual runs do not publish releases.
-
-The app checks the latest published, non-prerelease GitHub release and offers an update only when its version is newer. Keep the assets named `scrcpy-gui-windows-x64.zip` and `scrcpy-gui-linux-x64.tar.gz`; the updaters verify their GitHub SHA-256 digests before installation. Workflow artifacts alone are not visible to the updater.
-
-To test update detection locally, configure a build with a lower version, such as `"-DSCRCPY_VERSION=0.0.1"`, rebuild, and use **Settings → Check updates**. Builds made before the repository address was corrected must first be rebuilt or manually replaced with a current release.
+scrcpy-gui is free software under the [GNU General Public License v3.0](LICENSE.txt). It is not affiliated with Genymobile or the scrcpy project.
